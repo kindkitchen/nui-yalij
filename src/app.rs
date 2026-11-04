@@ -30,6 +30,8 @@ pub struct App {
     store: Store,
     runtime: Runtime,
     plugins: Plugins,
+    /// The command of new terminals.
+    shell: String,
     pub quit: bool,
 }
 
@@ -37,7 +39,8 @@ impl App {
     /// Start from a state: its plugins load and its terminals run.
     pub fn new(nui: Nui, store: Store, events: Sender<Event>, size: (u16, u16), shell: String) -> App {
         let runtime = Runtime::new(events, size);
-        let mut app = App { nui: Nui::default(), store, runtime, plugins: Plugins::new(shell), quit: false };
+        let plugins = Plugins::new(shell.clone());
+        let mut app = App { nui: Nui::default(), store, runtime, plugins, shell, quit: false };
         app.commit(nui);
         app
     }
@@ -131,7 +134,7 @@ impl App {
         }
         if self.nui.navigation.is_some() {
             let mut next = self.nui.clone();
-            self.quit |= nav::key(&mut next, &key) == nav::Outcome::Quit;
+            self.quit |= nav::key(&mut next, &key, &self.shell) == nav::Outcome::Quit;
             self.commit(next);
         } else {
             self.type_in(&key);

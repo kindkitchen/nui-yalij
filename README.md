@@ -36,10 +36,15 @@ Any other strategy comes from a plugin.
 | view       | `enter`        | start the focused terminal, when stopped or exited                |
 | navigation | `h` `l`        | focus the section left, right                                     |
 | navigation | `j` `k`        | hover the next, previous item; sections to the right follow       |
+| navigation | `a`            | add an item after the hovered one, then name it and those inside  |
 | navigation | `r` `x` `s`    | rename, remove, stop the hovered item                             |
 | navigation | `enter`        | approve the operation; enter the pane, or go to the next section  |
 | navigation | `esc`          | cancel the operation, or close the panel: back where you were     |
 | navigation | `q`            | quit: processes stop, sessions start again with the next run      |
+
+Adding an item adds one of every level inside it, down to a pane with a new shell that
+starts where the hovered one is. Each is named automatically, as `window-2`: enter takes
+the typed name instead and goes on to the next level, esc keeps the automatic names.
 
 Removing an item removes all it holds and the containers it leaves empty, and the
 terminals no pane shows anymore. Stopping keeps the structure: entering a stopped pane

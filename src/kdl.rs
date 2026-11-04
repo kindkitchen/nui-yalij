@@ -90,6 +90,7 @@ fn navigation(navigation: &Navigation) -> KdlNode {
     }
     match &navigation.operation {
         Some(Operation::Rename { input }) => node = node.child(self::node("rename").arg(input.as_str()).0),
+        Some(Operation::Create { input }) => node = node.child(self::node("create").arg(input.as_str()).0),
         Some(Operation::Remove) => node = node.child(self::node("remove").0),
         Some(Operation::Stop) => node = node.child(self::node("stop").0),
         None => {}
@@ -311,10 +312,11 @@ impl<'a> Decoder<'a> {
             cursor.set(level, entries.index(level.name())?.unwrap_or(0));
         }
         let mut operation = None;
-        for child in self.children(node, &["rename", "remove", "stop"])? {
+        for child in self.children(node, &["rename", "create", "remove", "stop"])? {
             let entries = self.read(child, &[])?;
             operation = Some(match child.name().value() {
                 "rename" => Operation::Rename { input: entries.optional_string_arg()?.unwrap_or_default() },
+                "create" => Operation::Create { input: entries.optional_string_arg()?.unwrap_or_default() },
                 "remove" => Operation::Remove,
                 _ => Operation::Stop,
             });
@@ -405,6 +407,8 @@ mod tests {
         nui.message = Some("hello".into());
         let text = encode(&nui);
         assert_eq!(decode(&text).unwrap(), nui, "{text}");
+        nui.navigation.as_mut().unwrap().operation = Some(Operation::Create { input: String::new() });
+        assert_eq!(decode(&encode(&nui)).unwrap(), nui);
     }
 
     #[test]

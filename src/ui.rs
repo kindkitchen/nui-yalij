@@ -15,7 +15,7 @@ use crate::layout::{self, Container, Draw, Placement, Scene, Shown};
 use crate::runtime::{Runtime, lock};
 use crate::state::{Level, Location, Navigation, Nui, Operation, Status, Terminal};
 
-const HINTS: &str = "hjkl move  enter go  r rename  x remove  s stop  esc back  q quit";
+const HINTS: &str = "hjkl move  enter go  a add  r rename  x remove  s stop  esc back  q quit";
 
 /// The view: the scene of the attached session, with the cursor of the
 /// focused pane.
@@ -57,8 +57,13 @@ pub fn navigation(
         None => buffer.set_stringn(status.x + 1, status.y, HINTS, status.width as usize, Color::DarkGray),
     };
     preview(buffer, nui, runtime, navigation, bottom, place);
+    let column = columns[navigation.focus as usize];
     match &navigation.operation {
-        Some(Operation::Rename { input }) => rename(frame, navigation, input, columns[navigation.focus as usize], top),
+        Some(Operation::Rename { input }) => prompt(frame, navigation, "Rename:", input, column, top),
+        Some(Operation::Create { input }) => {
+            let title = format!("New {}:", navigation.focus.name());
+            prompt(frame, navigation, &title, input, column, top);
+        }
         Some(operation) => confirm(frame, nui, navigation, operation, top),
         None => {}
     }
@@ -149,8 +154,8 @@ fn preview(
     draws(buffer, &scene.draws);
 }
 
-/// The input of a rename, under the hovered item as in yazi.
-fn rename(frame: &mut Frame, navigation: &Navigation, input: &str, column: Rect, top: Rect) {
+/// The input of a name, under the hovered item as in yazi.
+fn prompt(frame: &mut Frame, navigation: &Navigation, title: &str, input: &str, column: Rect, top: Rect) {
     let screen = frame.area();
     let hovered = navigation.cursor.get(navigation.focus);
     let row = column.y + 1 + (hovered - scroll(hovered, column.height.saturating_sub(1))) as u16;
@@ -165,7 +170,7 @@ fn rename(frame: &mut Frame, navigation: &Navigation, input: &str, column: Rect,
     let shown: String = input.chars().skip(input.chars().count().saturating_sub(room)).collect();
     let cursor = Position::new(popup.x + 1 + Line::raw(shown.as_str()).width() as u16, popup.y + 1);
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(shown).block(popup_block("Rename:")), popup);
+    frame.render_widget(Paragraph::new(shown).block(popup_block(title)), popup);
     frame.set_cursor_position(cursor);
 }
 
@@ -198,8 +203,9 @@ fn popup_block(title: &str) -> Block<'_> {
     Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().blue()).title(title)
 }
 
-/// A pane: the screen of its terminal, with a badge when it doesn't run.
-/// Returns the cursor of the terminal, when in sight.
+/// A pane: the screen of its terminal, with a badge when it doesn't run,
+/// telling what to do in the focused one. Returns the cursor of the terminal,
+/// when in sight.
 fn pane(buffer: &mut Buffer, nui: &Nui, runtime: &Runtime, shown: &Shown, focused: bool) -> Option<Position> {
     let terminal = nui.shown(shown.at)?;
     let running = terminal.status == Status::Running;
@@ -210,8 +216,8 @@ fn pane(buffer: &mut Buffer, nui: &Nui, runtime: &Runtime, shown: &Shown, focuse
     });
     if !running {
         let (text, color) = status(terminal);
-        let hint = if focused { " · enter: start" } else { "" };
-        let badge = format!(" {text}{hint} ");
+        let hint = if focused { format!(" · enter: restart · {}: panel", nui.toggle) } else { String::new() };
+        let badge = format!(" {} {text}{hint} ", terminal.program_name());
         let width = Line::raw(badge.as_str()).width() as u16;
         let x = shown.area.right().saturating_sub(width).max(shown.area.x);
         buffer.set_stringn(x, shown.area.y, badge, shown.area.width as usize, Style::new().black().bg(color));
@@ -219,13 +225,15 @@ fn pane(buffer: &mut Buffer, nui: &Nui, runtime: &Runtime, shown: &Shown, focuse
     cursor
 }
 
-/// How a terminal is, in words and color.
+/// How a terminal is, in words and color: an exit is an error only with a
+/// code telling so.
 fn status(terminal: &Terminal) -> (String, Color) {
     match (terminal.status, terminal.exit) {
         (Status::Running, _) => ("running".into(), Color::Green),
         (Status::Stopped, _) => ("stopped".into(), Color::Yellow),
-        (Status::Exited, Some(code)) => (format!("exited {code}"), Color::Red),
-        (Status::Exited, None) => ("failed".into(), Color::Red),
+        (Status::Exited, Some(0)) => ("exited".into(), Color::Gray),
+        (Status::Exited, Some(code)) => (format!("exited with {code}"), Color::Red),
+        (Status::Exited, None) => ("failed to start".into(), Color::Red),
     }
 }
 
@@ -303,7 +311,13 @@ mod tests {
     fn draws_at_any_size() {
         let (events, _) = std::sync::mpsc::channel();
         let runtime = Runtime::new(events, (24, 80));
-        let operations = [None, Some(Operation::Rename { input: "x".repeat(50) }), Some(Operation::Remove), Some(Operation::Stop)];
+        let operations = [
+            None,
+            Some(Operation::Rename { input: "x".repeat(50) }),
+            Some(Operation::Create { input: String::new() }),
+            Some(Operation::Remove),
+            Some(Operation::Stop),
+        ];
         for (width, height) in [(1, 1), (10, 3), (40, 2), (30, 8), (200, 60)] {
             for operation in operations.clone() {
                 for focus in Level::ALL {
@@ -313,6 +327,23 @@ mod tests {
                     terminal.draw(|frame| navigation(frame, &nui, &runtime, &mut |_, c| layout::tabs(c))).unwrap();
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_badge_tells_what_happened_and_what_to_do() {
+        let (events, _) = std::sync::mpsc::channel();
+        let runtime = Runtime::new(events, (24, 80));
+        let mut nui = sample();
+        let area = Rect::new(0, 0, 80, 3);
+        for (exit, badge) in [(0, " sh exited · enter: restart · ctrl-g: panel "), (2, " sh exited with 2 · ")] {
+            let shown = &mut nui.sessions[0].terminals[0];
+            (shown.status, shown.exit) = (Status::Exited, Some(exit));
+            let scene = layout::scene(&nui, Level::Session, Location::default(), area, &mut |_, c| layout::tabs(c));
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal.draw(|frame| view(frame, &nui, &runtime, &scene)).unwrap();
+            let top: String = (0..area.width).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+            assert!(top.contains(badge), "{top}");
         }
     }
 }

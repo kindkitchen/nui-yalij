@@ -5,7 +5,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Level, Navigation, Nui, Operation};
+use crate::state::{Level, Location, Navigation, Nui, Operation};
 
 /// What a key in the panel asks of the application, beyond the state.
 #[derive(Debug, PartialEq)]
@@ -26,24 +26,29 @@ pub fn close(nui: &mut Nui) {
     nui.navigation = None;
 }
 
-/// Handle a key of the panel.
-pub fn key(nui: &mut Nui, key: &KeyEvent) -> Outcome {
+/// Handle a key of the panel; new terminals run `shell`.
+pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
     let Some(Navigation { focus, cursor, operation }) = nui.navigation.clone() else { return Outcome::Stay };
     nui.message = None;
     match operation {
-        Some(Operation::Rename { mut input }) => match key.code {
+        Some(mut operation @ (Operation::Rename { .. } | Operation::Create { .. })) => match key.code {
             KeyCode::Esc => set_operation(nui, None),
-            KeyCode::Enter => match nui.rename(focus, cursor, &input) {
-                Ok(()) => set_operation(nui, None),
-                Err(error) => nui.message = Some(error),
-            },
+            KeyCode::Enter => {
+                if let Err(error) = approve(nui, focus, cursor, operation) {
+                    nui.message = Some(error);
+                }
+            }
             KeyCode::Backspace => {
-                input.pop();
-                set_operation(nui, Some(Operation::Rename { input }));
+                if let Some(input) = operation.input_mut() {
+                    input.pop();
+                }
+                set_operation(nui, Some(operation));
             }
             KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                input.push(c);
-                set_operation(nui, Some(Operation::Rename { input }));
+                if let Some(input) = operation.input_mut() {
+                    input.push(c);
+                }
+                set_operation(nui, Some(operation));
             }
             _ => {}
         },
@@ -68,6 +73,7 @@ pub fn key(nui: &mut Nui, key: &KeyEvent) -> Outcome {
             KeyCode::Char('l') | KeyCode::Right => move_focus(nui, 1),
             KeyCode::Char('j') | KeyCode::Down => move_cursor(nui, 1),
             KeyCode::Char('k') | KeyCode::Up => move_cursor(nui, -1),
+            KeyCode::Char('a') => create(nui, focus, cursor, shell),
             KeyCode::Char('r') => {
                 let input = name(nui, focus, cursor);
                 set_operation(nui, Some(Operation::Rename { input }));
@@ -87,11 +93,48 @@ pub fn key(nui: &mut Nui, key: &KeyEvent) -> Outcome {
     Outcome::Stay
 }
 
-/// Pasted text goes into a rename, as typed.
+/// Pasted text goes into a name being typed, as typed.
 pub fn paste(nui: &mut Nui, text: &str) {
-    if let Some(Navigation { operation: Some(Operation::Rename { input }), .. }) = nui.navigation.as_mut() {
+    let operation = nui.navigation.as_mut().and_then(|navigation| navigation.operation.as_mut());
+    if let Some(input) = operation.and_then(Operation::input_mut) {
         input.extend(text.chars().filter(|c| !c.is_control()));
     }
+}
+
+/// Create an item after the hovered one, its terminal where the hovered one
+/// is, and name it.
+fn create(nui: &mut Nui, focus: Level, cursor: Location, shell: &str) {
+    let cwd = nui.shown(cursor).and_then(|terminal| terminal.cwd.clone());
+    let Some(at) = nui.create(focus, cursor, shell, cwd) else { return };
+    if let Some(navigation) = nui.navigation.as_mut() {
+        navigation.cursor = at;
+        navigation.operation = Some(Operation::Create { input: String::new() });
+    }
+}
+
+/// Give the hovered item the typed name. A new one keeps its automatic name
+/// when none is typed, and the first item inside it is named next.
+fn approve(nui: &mut Nui, focus: Level, cursor: Location, operation: Operation) -> Result<(), String> {
+    let next = match operation {
+        Operation::Create { input } => {
+            if !input.trim().is_empty() {
+                nui.rename(focus, cursor, &input)?;
+            }
+            (focus < Level::Pane).then(|| Operation::Create { input: String::new() })
+        }
+        Operation::Rename { input } => {
+            nui.rename(focus, cursor, &input)?;
+            None
+        }
+        Operation::Remove | Operation::Stop => None,
+    };
+    if let Some(navigation) = nui.navigation.as_mut() {
+        if next.is_some() {
+            navigation.focus = focus.step(1);
+        }
+        navigation.operation = next;
+    }
+    Ok(())
 }
 
 fn set_operation(nui: &mut Nui, operation: Option<Operation>) {
@@ -121,7 +164,7 @@ fn move_cursor(nui: &mut Nui, delta: isize) {
 
 /// The name a rename starts from: the node's own, so an unnamed one stays
 /// unnamed unless typed.
-fn name(nui: &Nui, level: Level, at: crate::state::Location) -> String {
+fn name(nui: &Nui, level: Level, at: Location) -> String {
     let name = match level {
         Level::Session => nui.sessions.get(at.session).map(|session| session.name.clone()),
         Level::Window => nui.window(at).and_then(|window| window.name.clone()),
@@ -134,7 +177,7 @@ fn name(nui: &Nui, level: Level, at: crate::state::Location) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Location, Status, tests::sample};
+    use crate::state::{Status, tests::sample};
 
     fn press(nui: &mut Nui, keys: &str) -> Outcome {
         let mut outcome = Outcome::Stay;
@@ -145,7 +188,7 @@ mod tests {
                 '\x7f' => KeyCode::Backspace,
                 c => KeyCode::Char(c),
             };
-            outcome = key(nui, &KeyEvent::new(code, KeyModifiers::NONE));
+            outcome = key(nui, &KeyEvent::new(code, KeyModifiers::NONE), "sh");
         }
         outcome
     }
@@ -179,6 +222,29 @@ mod tests {
         press(&mut nui, "hhjr");
         press(&mut nui, "\x1b\x1b");
         assert_eq!(nui, before);
+    }
+
+    #[test]
+    fn add_names_the_new_item_then_the_ones_inside() {
+        let mut nui = sample();
+        open(&mut nui);
+        let names = |nui: &Nui, at| Level::ALL.map(|level| nui.label(level, at));
+        // a session after the hovered one, then its window, named; esc keeps
+        // the automatic names of the rest
+        press(&mut nui, "hhhawork\ndev\n\x1b");
+        assert_eq!(cursor(&nui), (Level::Tab, Location { session: 1, ..Location::default() }));
+        assert_eq!(names(&nui, cursor(&nui).1), ["work", "dev", "tab-1", "pane-1"]);
+        // no name keeps the automatic one, and goes on
+        press(&mut nui, "a\n\n");
+        assert_eq!(cursor(&nui), (Level::Pane, Location { session: 1, tab: 1, ..Location::default() }));
+        assert_eq!(names(&nui, cursor(&nui).1), ["work", "dev", "tab-2", "pane-1"]);
+        assert!(nui.navigation.as_ref().unwrap().operation.is_none());
+        // a session needs a name of its own
+        press(&mut nui, "hhhamain\n");
+        assert!(nui.message.is_some());
+        press(&mut nui, "\x1b");
+        assert_eq!(nui.sessions[2].name, "session-3");
+        nui.normalize().unwrap();
     }
 
     #[test]

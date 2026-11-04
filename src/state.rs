@@ -134,6 +134,9 @@ pub struct Navigation {
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Operation {
     Rename { input: String },
+    /// Naming an item just created: an empty input keeps its automatic name,
+    /// and approving goes on to the first item inside it.
+    Create { input: String },
     Remove,
     Stop,
 }
@@ -217,6 +220,16 @@ impl Default for Window {
 impl Default for Tab {
     fn default() -> Self {
         Self { name: None, layout: DEFAULT_LAYOUT.into(), active: 0, panes: Vec::new() }
+    }
+}
+
+impl Operation {
+    /// The name typed, in the operations taking one.
+    pub fn input_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Operation::Rename { input } | Operation::Create { input } => Some(input),
+            Operation::Remove | Operation::Stop => None,
+        }
     }
 }
 
@@ -476,6 +489,48 @@ impl Nui {
         self.sessions.len() - 1
     }
 
+    /// Create a node at `level` after the one at `at`, with one of every level
+    /// below it: the last a pane showing a new terminal, running `command` in
+    /// `cwd`. Each is named automatically. Returns where the new node is.
+    pub fn create(&mut self, level: Level, at: Location, command: &str, cwd: Option<String>) -> Option<Location> {
+        let id = self.next_terminal_id();
+        let first = |level| Some(automatic(level, &[]));
+        let pane = Pane { name: first(Level::Pane), terminal: id };
+        let tab = Tab { name: first(Level::Tab), panes: vec![pane.clone()], ..Tab::default() };
+        let window = Window { name: first(Level::Window), tabs: vec![tab.clone()], ..Window::default() };
+        let terminal = Terminal::new(id, command, cwd);
+        if level == Level::Session {
+            let names: Vec<_> = self.sessions.iter().map(|session| Some(session.name.as_str())).collect();
+            let name = automatic(level, &names);
+            let session = Session { name, terminals: vec![terminal], windows: vec![window], ..Session::default() };
+            let index = insert(&mut self.sessions, &mut self.attached, at.session + 1, session);
+            return Some(Location { session: index, ..Location::default() });
+        }
+        let session = self.sessions.get_mut(at.session)?;
+        let new = match level {
+            Level::Window => {
+                let names: Vec<_> = session.windows.iter().map(|window| window.name.as_deref()).collect();
+                let window = Window { name: Some(automatic(level, &names)), ..window };
+                let index = insert(&mut session.windows, &mut session.active, at.window + 1, window);
+                Location { session: at.session, window: index, ..Location::default() }
+            }
+            Level::Tab => {
+                let parent = session.windows.get_mut(at.window)?;
+                let names: Vec<_> = parent.tabs.iter().map(|tab| tab.name.as_deref()).collect();
+                let tab = Tab { name: Some(automatic(level, &names)), ..tab };
+                Location { tab: insert(&mut parent.tabs, &mut parent.active, at.tab + 1, tab), pane: 0, ..at }
+            }
+            _ => {
+                let parent = session.windows.get_mut(at.window)?.tabs.get_mut(at.tab)?;
+                let names: Vec<_> = parent.panes.iter().map(|pane| pane.name.as_deref()).collect();
+                let pane = Pane { name: Some(automatic(level, &names)), ..pane };
+                Location { pane: insert(&mut parent.panes, &mut parent.active, at.pane + 1, pane), ..at }
+            }
+        };
+        session.terminals.push(terminal);
+        Some(new)
+    }
+
     /// Rename the node at `level` of `at`. An empty name gives a window, tab or
     /// pane back the name of what it shows; a session needs a unique one.
     pub fn rename(&mut self, level: Level, at: Location, name: &str) -> Result<(), String> {
@@ -650,6 +705,26 @@ fn clamp(index: &mut usize, len: usize) {
     *index = (*index).min(len.saturating_sub(1));
 }
 
+/// The automatic name of a node at `level` joining siblings of these names:
+/// `window-3` as the third window, or the next one no sibling has.
+fn automatic(level: Level, siblings: &[Option<&str>]) -> String {
+    (siblings.len() + 1..)
+        .map(|n| format!("{}-{n}", level.name()))
+        .find(|name| !siblings.contains(&Some(name.as_str())))
+        .unwrap_or_default()
+}
+
+/// Insert `item` at `index`, or last when beyond, keeping `active` on the item
+/// it was on. Returns where the item went.
+fn insert<T>(list: &mut Vec<T>, active: &mut usize, index: usize, item: T) -> usize {
+    let index = index.min(list.len());
+    if *active >= index && !list.is_empty() {
+        *active += 1;
+    }
+    list.insert(index, item);
+    index
+}
+
 /// Follow the removal of the item at `removed`: the next one takes its place.
 fn shift(index: &mut usize, removed: usize, len: usize) {
     if *index > removed {
@@ -744,6 +819,27 @@ pub(crate) mod tests {
         assert_eq!(nui.sessions.len(), 1);
         assert_eq!(nui.sessions[0].name, "other");
         assert_eq!(nui.attached, 0);
+    }
+
+    #[test]
+    fn creation_goes_after_the_hovered_with_automatic_names() {
+        let mut nui = sample();
+        nui.sessions[0].active = 1;
+        // a window after the first: the active second one stays active, as third
+        let new = nui.create(Level::Window, at(0, 0, 1, 0), "sh", None).unwrap();
+        assert_eq!(new, at(0, 1, 0, 0));
+        assert_eq!(nui.sessions[0].active, 2);
+        let window = &nui.sessions[0].windows[1];
+        assert_eq!(window.name.as_deref(), Some("window-3"));
+        assert_eq!((window.tabs[0].name.as_deref(), window.tabs[0].panes[0].name.as_deref()), (Some("tab-1"), Some("pane-1")));
+        assert_eq!(nui.sessions[0].terminal(4).map(|terminal| terminal.command.as_str()), Some("sh"));
+        // a taken name is skipped
+        nui.rename(Level::Pane, at(0, 0, 0, 0), "pane-3").unwrap();
+        let new = nui.create(Level::Pane, at(0, 0, 0, 1), "sh", None).unwrap();
+        assert_eq!(nui.pane(new).unwrap().name.as_deref(), Some("pane-4"));
+        assert_eq!(nui.create(Level::Session, at(0, 0, 0, 0), "sh", None), Some(at(1, 0, 0, 0)));
+        assert_eq!(nui.sessions[1].name, "session-2");
+        nui.normalize().unwrap();
     }
 
     #[test]
