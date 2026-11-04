@@ -55,7 +55,11 @@ impl Store {
     pub fn lock(&mut self) -> Result<bool, String> {
         let mut path = OsString::from(self.path.as_os_str());
         path.push(".lock");
-        let file = File::create(&path).map_err(|error| format!("{}: {error}", Path::new(&path).display()))?;
+        let error = |error: std::io::Error| format!("{}: {error}", Path::new(&path).display());
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir).map_err(error)?;
+        }
+        let file = File::create(&path).map_err(error)?;
         match file.try_lock() {
             Ok(()) => {
                 self.lock = Some(file);
@@ -151,7 +155,6 @@ mod tests {
     #[test]
     fn one_instance_holds_the_lock() {
         let dir = std::env::temp_dir().join(format!("nui-yalij-lock-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
         let mut first = Store::new(dir.join("state.kdl"));
         let mut second = Store::new(dir.join("state.kdl"));
         assert_eq!(first.lock(), Ok(true));
