@@ -1,119 +1,283 @@
 # v0.1.0-nui-yalij
 
-The first variant of nui: **ya**zi + ze**lij**. A terminal multiplexer whose whole
-application is one serializable state, `Nui`, kept as KDL. Everything derives from it,
-never the other way:
+The first variant of nui: **ya**zi + ze**lij**. A terminal multiplexer derived
+from authoritative KDL state. Processes, layouts and navigation follow state;
+runtime observations enter it as facts. Configuration lives separately, as
+**decoration**.
 
-- the **view**: the terminals of the attached session, reachable by the person;
-- the **navigation panel**: yazi-style sections of the state, over a live preview;
-- the **processes**: the runtime starts and stops them to match the state.
+Requires Unix (macOS/Linux) and Rust 1.89+.
 
-An event (a key, a process exiting, an edit of the state file, a plugin) makes a new
-state, and the rest follows it. What the runtime learns (pid, exit code, foreground
-program, cwd, title) reaches the state as a fact, through the same flow.
+## Run
 
-```sh
-cargo run --release -- [--state <file>] [attach [<session>] | list | help]
+No installation or PATH registration needed:
+
+```nu
+cargo run --release -- attach main
+# In another terminal: the same processes and shared active tabs/panes.
+./target/release/nui-yalij attach main
+# A different session, in the same catalog.
+./target/release/nui-yalij attach other
+# Same session, another instance's decoration.
+./target/release/nui-yalij --profile work attach main
 ```
 
-## Primitives
+The first attachment starts a background coordinator. It hosts **one serialized
+session server/PTY owner per session**, reused by every connection to that session.
+These are independent owners in **one process**, not one OS process per session.
+There is no second local copy of session state in the terminal client.
+
+The coordinator routes navigation operations to the target session's owner.
+Previewing/renaming/stopping a pane in another session changes **that session**,
+even if you never enter it. Switching attachment changes routing/presence only:
+it neither transfers nor restarts processes. Everyone viewing the changed session
+reacts to the same update.
+
+Closing an instance disconnects it; its sessions keep running. A terminal shared
+by differently sized instances takes the size of the instance that typed last.
+The navigation cursor/prompt is per instance, but active windows, tabs, panes,
+layout names and terminal status are shared.
+
+## Commands
+
+```nu
+./target/release/nui-yalij list
+./target/release/nui-yalij reload
+./target/release/nui-yalij kill          # observe only
+./target/release/nui-yalij kill --apply # stop all owners/clients in this catalog
+./target/release/nui-yalij server       # foreground coordinator, for debugging
+./target/release/nui-yalij --repl
+./target/release/nui-yalij attach --repl
+./target/release/nui-yalij kill --repl
+```
+
+`--state <global.kdl>` selects a catalog; different catalogs are independent.
+`--config <dir>` selects its global/profile decoration directory. Every client of
+a catalog must use the same config directory; `--profile <name>` is per instance.
+
+Inside a pane, `nui-yalij attach other` switches the connected instance that last
+typed into that terminal, not every viewer. The spawned shell inherits
+`NUI_YALIJ_STATE`, `NUI_YALIJ_SESSION` and `NUI_YALIJ_TERMINAL` for this routing.
+
+**REPL:** complete a command with j/k or arrows, enter to choose, esc to go back
+(or cancel at the root). Choose an existing session or name a new one. The
+completed command is shown before `Apply? (N/y)`. Only lowercase `y` executes.
+Even a supplied `--apply` does not bypass this confirmation. Cancellation never
+starts a daemon or writes state.
+
+**Installation is deferred:** `install`, `update` and `remove` only explain that
+they will be implemented when the application reaches a more stable release.
+They make no changes, including with `--apply`. No installer/download script or
+partial uninstall is provided yet.
+
+## Primitives and keys
 
 `Session -> Window -> Tab -> Pane`, each container holding at least one child.
 
-- **Session**: the entry point, persisted between runs. It owns its terminals.
-- **Window**, **Tab**: groupings, each a marker of one visualization.
-- **Pane**: shows a terminal by id; many panes may show the same one, or none (detached).
+- A **session** owns terminals, independently persisted.
+- **Windows** and **tabs** are groupings, each a marker of one visualization.
+- A **pane** shows a terminal by id; many panes may show the same terminal.
+- A container's layout strategy places its children. Built-in `tabs` shows the
+  active child; plugins provide other strategies.
 
-The path from a session to a pane is a *location* of a terminal. A container places its
-children with its *layout strategy*: `tabs` by default and built in, one child at a time.
-Any other strategy comes from a plugin.
+Default keys (overridable by decoration):
 
-## Keys
+| Where      | Key         | Action |
+|------------|-------------|--------|
+| view       | ctrl-g      | Open/close navigation |
+| view       | enter       | Restart the focused stopped/exited terminal |
+| navigation | h/l, ←/→    | Focus the section left/right |
+| navigation | j/k, ↓/↑    | Hover next/previous; sections to the right follow |
+| navigation | a           | Add after hovered item, naming each level |
+| navigation | r/x/s       | Rename/remove/stop hovered item |
+| navigation | enter       | Approve operation; enter pane or next section |
+| navigation | esc         | Cancel operation or return to original attachment |
+| navigation | q           | Disconnect **this instance only** |
+| navigation | Q           | Stop **all session servers and clients in this catalog** |
 
-| where      | key            | does                                                              |
-|------------|----------------|-------------------------------------------------------------------|
-| view       | `ctrl-g`       | toggle the panel (the state's `toggle`)                           |
-| view       | `enter`        | start the focused terminal, when stopped or exited                |
-| navigation | `h` `l`        | focus the section left, right                                     |
-| navigation | `j` `k`        | hover the next, previous item; sections to the right follow       |
-| navigation | `a`            | add an item after the hovered one, then name it and those inside  |
-| navigation | `r` `x` `s`    | rename, remove, stop the hovered item                             |
-| navigation | `enter`        | approve the operation; enter the pane, or go to the next section  |
-| navigation | `esc`          | cancel the operation, or close the panel: back where you were     |
-| navigation | `q`            | quit: processes stop, sessions start again with the next run      |
+Adding creates one of every child level down to a new shell, in the hovered
+terminal's directory. Enter takes a typed name and continues naming the next
+level; esc keeps the remaining automatic names (`window-2`, `tab-1`, etc.).
 
-Adding an item adds one of every level inside it, down to a pane with a new shell that
-starts where the hovered one is. Each is named automatically, as `window-2`: enter takes
-the typed name instead and goes on to the next level, esc keeps the automatic names.
+Removing cascades through empty containers and drops terminals no pane shows
+anymore. Stopping keeps structure; enter restarts the terminal.
 
-Removing an item removes all it holds and the containers it leaves empty, and the
-terminals no pane shows anymore. Stopping keeps the structure: entering a stopped pane
-starts it again.
+## State: global wrapper and independent session files
 
-## State
+Default global file:
 
-`$XDG_STATE_HOME/nui-yalij/state.kdl` (`~/.local/state/...`), or `--state <file>`. It's
-written after every change, and read again when someone else changes it: editing it while
-nui-yalij runs changes the TUI. A broken edit is reported and kept until fixed.
-`nui-yalij attach <session>` from inside a pane makes the running instance follow.
+`$XDG_STATE_HOME/nui-yalij/global-state.kdl` (fallback `~/.local/state/...`).
+
+It is only a catalog of stable session identities and live client presence:
 
 ```kdl
-toggle ctrl-g
-attached 1
-plugin "~/.config/nui-yalij/example.lua"
-session main active=1 {
+catalog version=1 {
+    session 1
+    session 4
+    client 7 session=1 profile=work {
+        navigation focus=pane session=4 window=1 tab=1 pane=2
+        message "the last notice"
+    }
+    client 8 session=4
+}
+```
+
+A client node exists only while connected. Edit its `session` to switch that
+instance, or delete its node to disconnect it. Navigation's session is also a
+**stable id**, not the session's position in the catalog. The other locations
+count from 1. Disconnected clients are discarded on server restart.
+
+For a global file `/path/global-state.kdl`, session 4 lives in:
+
+`/path/global-state.kdl.sessions/4/state.kdl`
+
+```kdl
+session main id=4 active=1 {
     terminal 1 command="/bin/zsh" cwd="/home/me" pid=4242 program=vim title="~"
     terminal 2 command=htop status=stopped {
         args "-d" "10"
     }
-    window "dev" {
+    window dev {
         tab layout=columns {
             pane terminal=1
-            pane "monitor" terminal=2
+            pane monitor terminal=2
         }
     }
 }
-navigation focus=pane session=1 window=1 tab=1 pane=2 {
-    rename "draft"
-}
-message "the last notice"
 ```
 
-Indices count from 1. Omitted values take defaults: `layout=tabs`, `active=1`,
-`status=running` (the others are `stopped`, by the person, and `exited`, on its own).
-Unnamed windows, tabs and panes show the name of what they show.
+The session id stays fixed across renames and catalog reordering. Terminal ids
+are local to a session. Defaults are `layout=tabs`, `active=1`, `status=running`;
+other statuses are `stopped` and `exited`. Unnamed windows/tabs/panes derive their
+labels from what they show.
+
+Each file has one locked writer. Client input, runtime facts, plugins and file
+edits are serialized; clients send **events, never stale replacement states**.
+Files are atomically replaced, and external edits are consumed before the next
+interactive mutation. Invalid edits are reported and left untouched until fixed.
+Valid edits affect every viewer of that session. The global file is live too.
+
+Removing a session from the catalog stops its owner but keeps its files for
+recovery. A matching session entry can reference those files again. A navigation
+removal likewise forgets the session; its old files are not silently purged.
+Stable ids are not automatically reused.
+
+### Old state files
+
+On first start, an existing default `state.kdl` is imported into the new catalog
+and session files, leaving the old file untouched. If `--state` points directly
+at an old monolithic file, it is backed up as `<file>.legacy.kdl` before migration.
+Stop the old application first: its lock is respected.
+
+Sessions, layout/active selection and terminal definitions survive. Legacy
+top-level `toggle`/`plugin` settings are no longer state: move them into decoration.
+Old singleton `attached`/`navigation`/`message` presence is not restored.
+
+## Decoration: global → profile → session
+
+All three levels have the same KDL schema:
+
+| Layer | File | When read |
+|-------|------|-----------|
+| global | `$XDG_CONFIG_HOME/nui-yalij/decoration.kdl` (`~/.config/...`) | Server start / explicit `reload` |
+| profile | `<config>/profiles/<name>.kdl` | Server start / explicit `reload` |
+| session | `<global.kdl>.sessions/<id>/decoration.kdl` | Live, including deletion |
+
+```kdl
+keys {
+    panel ctrl-g
+    left h left
+    right l right
+    next j down
+    previous k up
+    add a
+    rename r
+    remove x
+    stop s
+    enter enter
+    back esc
+    detach q
+    quit Q
+    restart enter
+}
+theme accent=blue active=green muted=darkgray notice=yellow error=red
+plugin "~/path/to/plugins/example.lua"
+```
+
+Later layers replace individual key actions and theme fields; a key action with
+no arguments disables it. Plugin lists accumulate, later entries take precedence,
+and duplicate paths load once. Paths are relative to **their decoration file**,
+or start with `~/`. Unknown nodes, actions, properties, keys and colors are errors.
+
+A profile decorates its instance; it cannot impose active tabs, layout names or
+other session state. Attaching/reloading a profile never runs its automatic
+`update` hooks. Its layouts and explicitly invoked key handlers can differ, but
+a user's explicit state-changing action is still shared. A session override
+wins over every viewer's profile, including while previewing that session.
+
+A broken static reload retains the previous snapshot. A broken live session
+decoration retains the previous valid layer until fixed. `reload` also re-reads
+plugin source files even if their paths have not changed; editing a Lua source
+alone does not hot-reload it.
 
 ## Plugins
 
-Lua 5.4 files listed by `plugin` (paths relative to the state file, or `~/`), loaded
-again when the list changes. A plugin returns a table with any of:
+Lua 5.4 scripts return a table. Scripts are trusted code, not sandboxed.
 
 ```lua
 return {
-  -- layout strategies by name: the areas of the children, and what to draw
   layouts = {
-    columns = function(container) -- { kind, area = { x, y, w, h }, active, children = { { name } } }
-      return { areas = { [1] = { x = 0, y = 0, w = 40, h = 24 } }, draw = { { x = 0, y = 0, text = "…", style = { fg = "blue" } } } }
+    columns = function(container)
+      -- kind, area={x,y,w,h}, active (1-based), children={{name}}, theme
+      return {
+        areas = { [1] = { x=0, y=0, w=40, h=24 } },
+        draw = { { x=0, y=0, text="…", style={fg=container.theme.accent} } },
+      }
     end,
   },
-  -- keys by mode, view or navigate: a new state, or nothing to keep the table changed in place
-  keys = { navigate = { n = function(state) end } },
-  -- after every change of the state
-  update = function(state) return state end,
+  keys = {
+    navigate = {
+      n = function(state, client)
+        -- Explicit action: state is a projection of all sessions plus this
+        -- client's attached (1-based index), navigation and message.
+        -- client = { id, session (stable id), profile? }
+      end,
+    },
+  },
+  update = function(state, session_id)
+    -- Automatic hooks from global/session decoration only.
+    -- Scoped to exactly this session at state.sessions[1]; no viewer profile.
+    -- May remove that session, but cannot create/change other sessions.
+    return state
+  end,
 }
 ```
 
-The state is the plain `Nui` table, as in KDL. Helpers in the global `nui`: `shell`, `next_id(state)`,
-and the operations of the panel `remove(state, level, location)`, `stop(…)`, `rename(…, name)`,
-`enter(state, location)`. `print` shows in the panel. Later plugins override earlier ones,
-plugin layouts and keys override the built-in ones.
+Handlers return a new state or nothing to keep their in-place edits. Existing
+one-argument handlers still work. Session tables now have a stable `id`.
+Layouts/keys from later plugins override earlier plugins and built-ins; automatic
+hooks run in global/session order. `print` is reported as a notice.
 
-[`plugins/example.lua`](plugins/example.lua) adds the `columns`, `rows` and `bar` (tabs with a bar)
-layouts, `n` (new item) and `c` (next layout) in the panel, and closes panes whose shell
-exited well.
+Helpers on global `nui`: `shell`, `next_id(state)`, `remove(state, level, location)`,
+`stop(…)`, `rename(…, name)`, `enter(state, location)`. Locations count from 1.
 
-## Not here (yet)
+[`plugins/example.lua`](plugins/example.lua) supplies `columns`, `rows`, `bar`,
+`n` (new item), `c` (next layout), and closes panes whose shell exited successfully.
+Put it in global/session decoration to enable that automatic cleanup, not just
+a profile.
 
-- A server: processes live while nui-yalij runs; on the next run, sessions start again
-  from the state, in their last directories.
-- Scrollback and the mouse in panes.
+## Checks and limits
+
+```nu
+cargo test --all-targets
+cargo clippy --all-targets -- -D warnings
+```
+
+Tests include real multi-client PTYs, same/different sessions, foreign-session
+navigation edits, concurrent startup, live files, reconnect/restart, per-instance
+profiles, decoration precedence/reload, inside attach, resize ownership, REPL
+confirmation, and forced shutdown.
+
+PTY content stays in memory: disconnect/reconnect preserves it, server restart
+does not. State persists and starts the terminals that should run again. No
+network transport, scrollback or mouse input yet. For background startup errors,
+see `<global.kdl>.server.log`.

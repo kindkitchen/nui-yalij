@@ -3,13 +3,15 @@ name = "nui-yalij"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "A terminal multiplexer derived from one state, after yazi and zellij"
+description = "Shared terminal sessions driven by KDL state and layered decoration"
 
 [dependencies]
+crossterm = { version = "0.29", features = ["serde"] }
 kdl = "6"
 libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored", "serde"] }
 portable-pty = "0.9"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 vt100 = "0.18"

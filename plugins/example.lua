@@ -1,6 +1,7 @@
 -- An example plugin: what the core leaves out, built on the state alone.
 --
--- Load it from the state file, with a path relative to it or from ~/:
+-- Load it from global or session decoration (not a profile, for update hooks):
+-- paths are relative to that decoration file, or from ~/:
 --   plugin "~/path/to/plugins/example.lua"
 --
 -- layouts: columns, rows, and bar: a bar of tabs over the active child

@@ -1,12 +1,10 @@
-//! End to end: nui-yalij in a pseudo terminal, driven by keys and read from
-//! its screen and its state file.
-
+//! Real PTYs and real sockets, with isolated homes and cleanup even on failure.
 use std::{
     fs,
     io::{Read, Write},
     num::NonZeroU16,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -16,26 +14,162 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 
 const BIN: &str = env!("CARGO_BIN_EXE_nui-yalij");
 const ROWS: u16 = 30;
-const COLS: u16 = 100;
+const COLS: u16 = 110;
+
+struct Home {
+    dir: PathBuf,
+}
+impl Home {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("nui-e2e-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Home {
+            dir: dir.canonicalize().unwrap(),
+        }
+    }
+    fn global(&self) -> PathBuf {
+        self.dir.join("global.kdl")
+    }
+    fn config(&self) -> PathBuf {
+        self.dir.join("config")
+    }
+    fn session(&self, id: u64) -> PathBuf {
+        self.dir.join(format!("global.kdl.sessions/{id}/state.kdl"))
+    }
+    fn decoration(&self, id: u64) -> PathBuf {
+        self.session(id).with_file_name("decoration.kdl")
+    }
+    fn read(&self, id: u64) -> String {
+        fs::read_to_string(self.session(id)).unwrap_or_default()
+    }
+    fn write(&self, path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    fn env(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("SHELL", "/bin/sh".into()),
+            ("HOME", self.dir.display().to_string()),
+            ("PS1", "$ ".into()),
+            ("ENV", String::new()),
+            ("BASH_SILENCE_DEPRECATION_WARNING", "1".into()),
+            ("TERM", "xterm-256color".into()),
+            ("XDG_RUNTIME_DIR", "/tmp".into()),
+            (
+                "XDG_CONFIG_HOME",
+                self.dir.join("xdg-config").display().to_string(),
+            ),
+            (
+                "XDG_STATE_HOME",
+                self.dir.join("xdg-state").display().to_string(),
+            ),
+        ]
+    }
+    fn command(&self, args: &[&str]) -> Output {
+        Command::new(BIN)
+            .args([
+                "--state",
+                self.global().to_str().unwrap(),
+                "--config",
+                self.config().to_str().unwrap(),
+            ])
+            .args(args)
+            .env_remove("NUI_YALIJ_STATE")
+            .env_remove("NUI_YALIJ_SESSION")
+            .env_remove("NUI_YALIJ_TERMINAL")
+            .envs(self.env())
+            .output()
+            .unwrap()
+    }
+    fn ok(&self, args: &[&str]) -> String {
+        let output = self.command(args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    fn wait(&self, about: &str, condition: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out: {about}; global: {:?}; session 1: {}; log: {:?}",
+                fs::read_to_string(self.global()),
+                self.read(1),
+                fs::read_to_string(self.dir.join("global.kdl.server.log"))
+            );
+            thread::sleep(Duration::from_millis(40));
+        }
+    }
+    fn pid(&self, id: u64, terminal: u64) -> Option<u32> {
+        let doc: kdl::KdlDocument = self.read(id).parse().ok()?;
+        doc.get("session")?
+            .children()?
+            .nodes()
+            .iter()
+            .find(|node| {
+                node.name().value() == "terminal"
+                    && node.get(0).and_then(kdl::KdlValue::as_integer) == Some(terminal as i128)
+            })?
+            .get("pid")?
+            .as_integer()
+            .and_then(|pid| u32::try_from(pid).ok())
+    }
+    fn stop(&self) {
+        self.ok(&["kill", "--apply"]);
+        self.wait("server shutdown", || !self.read(1).contains("pid="));
+    }
+}
+impl Drop for Home {
+    fn drop(&mut self) {
+        let _ = self.command(&["kill", "--apply"]);
+        // Kill replies before final persistence; don't remove a live owner's directory.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let output = self.command(&["kill"]);
+            if String::from_utf8_lossy(&output.stdout).contains("no server") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
 
 struct Tui {
     screen: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
-    _master: Box<dyn MasterPty + Send>,
+    master: Box<dyn MasterPty + Send>,
 }
-
 impl Tui {
-    fn start(dir: &Path) -> Tui {
+    fn start(home: &Home, args: &[&str]) -> Tui {
         let pair = native_pty_system()
-            .openpty(PtySize { rows: ROWS, cols: COLS, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows: ROWS,
+                cols: COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .unwrap();
         let mut command = CommandBuilder::new(BIN);
-        command.args(["--state", state(dir).to_str().unwrap()]);
-        for (key, value) in env(dir) {
+        command.args([
+            "--state",
+            home.global().to_str().unwrap(),
+            "--config",
+            home.config().to_str().unwrap(),
+        ]);
+        command.args(args);
+        for (key, value) in home.env() {
             command.env(key, value);
         }
-        command.cwd(dir);
+        for key in ["NUI_YALIJ_STATE", "NUI_YALIJ_SESSION", "NUI_YALIJ_TERMINAL"] {
+            command.env_remove(key);
+        }
+        command.cwd(&home.dir);
         let child = pair.slave.spawn_command(command).unwrap();
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -48,180 +182,554 @@ impl Tui {
                 output.lock().unwrap().process(&buffer[..count]);
             }
         });
-        Tui { screen, writer: pair.master.take_writer().unwrap(), child, _master: pair.master }
+        Tui {
+            screen,
+            writer: pair.master.take_writer().unwrap(),
+            child,
+            master: pair.master,
+        }
     }
-
     fn send(&mut self, keys: &str) {
         self.writer.write_all(keys.as_bytes()).unwrap();
         self.writer.flush().unwrap();
-        // keys apart, as typed: a lone escape is a key of its own
         thread::sleep(Duration::from_millis(80));
     }
-
     fn text(&self) -> String {
         self.screen.lock().unwrap().screen().contents()
     }
-
-    /// The screen row by row, for checks on where things are.
     fn rows(&self) -> Vec<String> {
-        let screen = self.screen.lock().unwrap();
-        screen.screen().rows(0, COLS).collect()
+        self.screen.lock().unwrap().screen().rows(0, COLS).collect()
     }
-
-    fn wait(&self, about: &str, done: impl Fn(&Tui) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if done(self) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
+    fn wait(&self, about: &str, condition: impl Fn(&Tui) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while !condition(self) {
+            assert!(
+                Instant::now() < deadline,
+                "timed out: {about}; screen:\n{}",
+                self.text()
+            );
+            thread::sleep(Duration::from_millis(40));
         }
-        panic!("timed out waiting for {about}; the screen:\n{}", self.text());
     }
-
-    fn wait_text(&self, text: &str) {
+    fn text_is(&self, text: &str) {
         self.wait(text, |tui| tui.text().contains(text));
     }
-
-    fn quit(mut self) {
-        self.send("\x07");
-        self.wait("the panel", |tui| tui.text().contains("sessions"));
-        self.send("q");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while self.child.try_wait().unwrap().is_none() {
-            assert!(Instant::now() < deadline, "nui-yalij did not quit:\n{}", self.text());
-            thread::sleep(Duration::from_millis(50));
+    fn view(&self) {
+        self.wait("the view", |tui| !tui.text().contains("sessions"));
+    }
+    fn prompt(&self) {
+        self.wait("a prompt", |tui| tui.rows()[0].starts_with('$'));
+    }
+    fn exited(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert_eq!(status.exit_code(), 0, "{}", self.text());
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "client did not exit: {}",
+                self.text()
+            );
+            thread::sleep(Duration::from_millis(40));
         }
     }
+    fn detach(&mut self, toggle: &str) {
+        self.send(toggle);
+        self.text_is("sessions");
+        self.send("q");
+        self.exited();
+    }
+    fn resize(&mut self, rows: u16, cols: u16) {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        thread::sleep(Duration::from_millis(150));
+    }
 }
-
-/// A fresh directory for a test, its home and state.
-fn dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("nui-yalij-e2e-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir.canonicalize().unwrap()
-}
-
-fn state(dir: &Path) -> PathBuf {
-    dir.join("state.kdl")
-}
-
-/// A plain shell with a plain prompt, whatever the person running the tests uses.
-fn env(dir: &Path) -> Vec<(&'static str, String)> {
-    vec![
-        ("SHELL", "/bin/sh".into()),
-        ("HOME", dir.display().to_string()),
-        ("PS1", "$ ".into()),
-        ("ENV", String::new()),
-        ("BASH_SILENCE_DEPRECATION_WARNING", "1".into()),
-        ("TERM", "xterm-256color".into()),
-    ]
-}
-
-fn read_state(dir: &Path) -> String {
-    fs::read_to_string(state(dir)).unwrap()
-}
-
-fn wait_state(dir: &Path, about: &str, done: impl Fn(&str) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done(&read_state(dir)) {
-        assert!(Instant::now() < deadline, "timed out waiting for {about}; the state:\n{}", read_state(dir));
-        thread::sleep(Duration::from_millis(50));
+impl Drop for Tui {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 #[test]
-fn navigate_rename_stop_and_follow_the_file() {
-    let dir = dir("core");
-    let mut tui = Tui::start(&dir);
-    tui.wait("a prompt", |tui| tui.rows()[0].starts_with('$'));
+fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
+    let home = Home::new("core");
+    home.write(&home.global(), "toggle ctrl-g\nsession main { terminal 1 command=\"/bin/sh\"; window { tab { pane terminal=1 } } }");
+    let mut tui = Tui::start(&home, &[]);
+    tui.prompt();
+    assert!(home.dir.join("global.kdl.legacy.kdl").exists());
+    assert!(!home.read(1).contains("toggle"));
     tui.send("echo hello-$((6 * 7))\r");
-    tui.wait_text("hello-42");
-
-    // the panel: four sections over the preview of the hovered pane
+    tui.text_is("hello-42");
     tui.send("\x07");
-    tui.wait("the panel", |tui| ["sessions", "windows", "tabs", "panes", "hello-42"].iter().all(|t| tui.text().contains(t)));
-    let rows = tui.rows();
-    assert!(rows[0].contains("sessions") && rows[0].contains("panes"), "{rows:#?}");
-    assert!(rows.iter().skip(ROWS as usize / 2).any(|row| row.contains("hello-42")), "the preview: {rows:#?}");
-
-    // rename the pane, then the session
-    tui.send("r");
-    tui.wait_text("Rename:");
-    tui.send("logs\r");
-    tui.wait_text("1 logs");
-    wait_state(&dir, "the pane name", |state| state.contains("pane logs") || state.contains("pane \"logs\""));
+    tui.text_is("panes");
+    assert!(
+        tui.rows()
+            .iter()
+            .skip(ROWS as usize / 2)
+            .any(|row| row.contains("hello-42"))
+    );
+    tui.send("rlogs\r");
+    home.wait("pane name", || home.read(1).contains("pane logs"));
     tui.send("hhhr");
     tui.send("\x7f\x7f\x7f\x7fdev\r");
-    wait_state(&dir, "the session name", |state| state.contains("session dev") || state.contains("session \"dev\""));
-
-    // esc goes back, where the person was
+    home.wait("session name", || home.read(1).contains("session dev"));
     tui.send("\x1b");
-    tui.wait("the view", |tui| !tui.text().contains("sessions"));
-    tui.wait_text("hello-42");
+    tui.view();
 
-    // the state file is the source of truth: an edit shows
-    let edited = read_state(&dir).replace("pane logs", "pane edited").replace("pane \"logs\"", "pane edited");
-    fs::write(state(&dir), edited).unwrap();
-    thread::sleep(Duration::from_millis(600));
+    home.write(
+        &home.session(1),
+        &home.read(1).replace("pane logs", "pane edited"),
+    );
     tui.send("\x07");
-    tui.wait_text("1 edited");
-
-    // stop the terminal of the pane, then enter it: it runs again
-    tui.send("s");
-    tui.wait_text("Stop?");
+    tui.text_is("1 edited");
+    home.write(&home.session(1), "session {");
+    tui.text_is("session 1:");
+    tui.send("j");
+    assert_eq!(
+        home.read(1),
+        "session {",
+        "invalid external edits must stay untouched"
+    );
+    let valid = fs::read_to_string(home.dir.join("global.kdl.legacy.kdl")).unwrap();
+    // Restore a valid single-session state (with a stable identity).
+    home.write(
+        &home.session(1),
+        &valid.replace("session main", "session dev id=1"),
+    );
+    home.wait("valid edit accepted", || home.pid(1, 1).is_some());
+    tui.send("s\r");
+    tui.text_is("stopped");
     tui.send("\r");
-    tui.wait_text("stopped");
-    wait_state(&dir, "a stopped terminal", |state| state.contains("stopped"));
-    tui.send("\r");
-    tui.wait("the view", |tui| !tui.text().contains("sessions"));
-    wait_state(&dir, "a running terminal", |state| !state.contains("status=") && state.contains("pid="));
-    tui.send("echo again\r");
-    tui.wait_text("again");
-
-    tui.quit();
-    let state = read_state(&dir);
-    assert!(!state.contains("navigation") && !state.contains("pid="), "{state}");
-    let list = Command::new(BIN).args(["--state", self::state(&dir).to_str().unwrap(), "list"]).output().unwrap();
-    let list = String::from_utf8(list.stdout).unwrap();
-    assert!(list.starts_with("dev  windows: 1  tabs: 1  panes: 1  terminals: 1  (attached)"), "{list}");
-    let _ = fs::remove_dir_all(&dir);
+    tui.view();
+    tui.send("echo after-restart\r");
+    tui.text_is("after-restart");
+    let pid = home.pid(1, 1).unwrap();
+    tui.detach("\x07");
+    assert_eq!(home.pid(1, 1), Some(pid));
+    let mut again = Tui::start(&home, &["attach", "dev"]);
+    again.text_is("after-restart");
+    assert_eq!(home.pid(1, 1), Some(pid));
+    assert!(
+        home.ok(&["kill"])
+            .contains("would stop 1 session server(s), 1 connected")
+    );
+    assert_eq!(home.pid(1, 1), Some(pid));
+    again.detach("\x07");
+    assert!(home.ok(&["list"]).contains("dev  id: 1  windows: 1"));
+    home.stop();
 }
 
 #[test]
-fn plugins_layouts_and_attach_from_inside() {
-    let dir = dir("plugin");
-    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/example.lua");
-    let text = format!(
-        "plugin \"{}\"\nsession main {{\n  terminal 1 command=\"/bin/sh\"\n  terminal 2 command=\"/bin/sh\"\n  window {{ tab layout=columns {{ pane terminal=1; pane terminal=2 }} }}\n}}\n",
-        example.display()
+fn same_and_different_sessions_share_only_session_state() {
+    let home = Home::new("multi");
+    // Simultaneous startup must reuse the one coordinator/session owner.
+    let mut a = Tui::start(&home, &["attach", "main"]);
+    let mut b = Tui::start(&home, &["attach", "main"]);
+    a.prompt();
+    b.prompt();
+    let pid = home.pid(1, 1).unwrap();
+    a.send("echo shared-output\r");
+    b.text_is("shared-output");
+    assert_eq!(home.pid(1, 1), Some(pid));
+    let mut c = Tui::start(&home, &["attach", "other"]);
+    c.prompt();
+    assert_ne!(home.pid(2, 1), Some(pid));
+    assert!(!c.text().contains("shared-output"));
+
+    // Edit a foreign session without entering it, then return to the original.
+    a.send("\x07");
+    a.text_is("panes");
+    a.send("hhhjlllrforeign\r");
+    home.wait("edit reaches the other owner", || {
+        home.read(2).contains("pane foreign")
+    });
+    a.send("\x1b");
+    a.view();
+    a.text_is("shared-output");
+    assert_eq!(home.pid(1, 1), Some(pid));
+    c.send("\x07");
+    c.text_is("1 foreign");
+    c.send("\x1b");
+    c.view();
+
+    // Both clients add against the latest authoritative state: no lost update.
+    a.send("\x07");
+    b.send("\x07");
+    a.text_is("panes");
+    b.text_is("panes");
+    a.send("aone\r");
+    b.send("atwo\r");
+    home.wait("both additions kept", || {
+        home.read(1).matches("pane ").count() == 3
+    });
+    a.send("\r");
+    a.view();
+    b.send("\x1b");
+    b.view();
+    a.send("echo focused-together\r");
+    b.text_is("focused-together");
+
+    // A global presence edit moves only that connection, not either session's state.
+    let global = fs::read_to_string(home.global()).unwrap();
+    let doc: kdl::KdlDocument = global.parse().unwrap();
+    let root = doc.get("catalog").unwrap();
+    let first = root
+        .children()
+        .unwrap()
+        .nodes()
+        .iter()
+        .find(|node| node.name().value() == "client")
+        .unwrap();
+    let client = first.get(0).unwrap().as_integer().unwrap();
+    let edited = global.replace(
+        &format!("client {client} session=1"),
+        &format!("client {client} session=2"),
     );
-    fs::write(state(&dir), text).unwrap();
-    let mut tui = Tui::start(&dir);
-    // two shells side by side, a rail apart
-    tui.wait("two columns", |tui| tui.rows()[0].starts_with('$') && tui.rows()[0].contains("│$"));
+    home.write(&home.global(), &edited);
+    // Startup races can assign a/b ids in either order.
+    home.wait("the moved client", || {
+        a.text().trim_end() == "$" || b.text().trim_end() == "$"
+    });
+    c.send("echo shared-other\r");
+    home.wait("the moved client sees other", || {
+        a.text().contains("shared-other") || b.text().contains("shared-other")
+    });
+    home.stop();
+    a.exited();
+    b.exited();
+    c.exited();
+}
 
-    // the plugin's key: a new pane after the hovered one
+#[test]
+fn per_instance_profiles_static_reload_and_live_session_override() {
+    let home = Home::new("decoration");
+    home.write(
+        &home.config().join("decoration.kdl"),
+        "keys { panel ctrl-a }\ntheme accent=red",
+    );
+    let plugin = home.config().join("profiles/work.lua");
+    home.write(
+        &plugin,
+        r#"return {
+        layouts = { tabs = function(c) return { areas = { [c.active] = c.area }, draw = {
+            {x=c.area.x,y=c.area.y,text="WORK",style={fg=c.theme.accent}}
+        } } end },
+        update = function(s) error("a profile must never run automatic state hooks") end
+    }"#,
+    );
+    home.write(
+        &home.config().join("profiles/work.kdl"),
+        "keys { panel ctrl-b }\ntheme accent=green\nplugin work.lua",
+    );
+    let mut plain = Tui::start(&home, &["attach", "main"]);
+    plain.prompt();
+    let pid = home.pid(1, 1).unwrap();
+    let mut work = Tui::start(&home, &["--profile", "work", "attach", "main"]);
+    work.text_is("WORK");
+    assert_eq!(home.pid(1, 1), Some(pid));
+    assert!(!plain.text().contains("WORK"));
+    plain.send("\x01");
+    plain.text_is("panes");
+    work.send("\x02");
+    work.text_is("panes");
+    assert!(!work.text().contains("automatic state hooks"));
+    plain.send("\x1b");
+    plain.view();
+    work.send("\x1b");
+    work.view();
+
+    // Global edits remain static until reload; a per-instance override still wins.
+    home.write(
+        &home.config().join("decoration.kdl"),
+        "keys { panel ctrl-c }\ntheme accent=blue",
+    );
+    thread::sleep(Duration::from_millis(350));
+    plain.send("\x01");
+    plain.text_is("panes");
+    plain.send("\x1b");
+    plain.view();
+    home.ok(&["reload"]);
+    plain.send("\x01");
+    assert!(!plain.text().contains("sessions"));
+    plain.send("\x03");
+    plain.text_is("panes");
+    plain.send("\x1b");
+    plain.view();
+    work.send("\x02");
+    work.text_is("panes");
+    work.send("\x1b");
+    work.view();
+
+    // Session overrides apply live, above BOTH viewers' chosen profiles.
+    home.write(
+        &home.decoration(1),
+        "keys { panel ctrl-d }\ntheme accent=yellow",
+    );
+    thread::sleep(Duration::from_millis(450));
+    plain.send("\x04");
+    plain.text_is("panes");
+    plain.send("\x1b");
+    plain.view();
+    work.send("\x04");
+    work.text_is("panes");
+    work.send("\x1b");
+    work.view();
+    let code = fs::read_to_string(&plugin)
+        .unwrap()
+        .replace("WORK", "RELOADED");
+    home.write(&plugin, &code);
+    assert!(!work.text().contains("RELOADED"));
+    home.ok(&["reload"]);
+    work.text_is("RELOADED");
+    home.write(&home.decoration(1), "theme typo=red");
+    thread::sleep(Duration::from_millis(350));
+    plain.send("\x04");
+    plain.text_is("panes");
+    plain.send("\x1b");
+    plain.view();
+    assert_eq!(
+        fs::read_to_string(home.decoration(1)).unwrap(),
+        "theme typo=red"
+    );
+    home.write(&home.config().join("decoration.kdl"), "theme typo=red");
+    assert!(!home.command(&["reload"]).status.success());
+    plain.send("\x04");
+    plain.text_is("panes");
+    plain.send("\x1b");
+    plain.view();
+    assert_eq!(home.pid(1, 1), Some(pid));
+    // Removing a live override restores the previous successful static snapshot.
+    fs::remove_file(home.decoration(1)).unwrap();
+    thread::sleep(Duration::from_millis(450));
+    plain.detach("\x03");
+    work.detach("\x02");
+    assert_eq!(home.pid(1, 1), Some(pid));
+}
+
+#[test]
+fn plugins_and_inside_attach_route_to_the_typing_instance() {
+    let home = Home::new("plugin");
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins/example.lua");
+    home.write(
+        &home.config().join("decoration.kdl"),
+        &format!("plugin \"{}\"", example.display()),
+    );
+    home.write(&home.global(), "session main { terminal 1 command=\"/bin/sh\"; terminal 2 command=\"/bin/sh\"; window { tab layout=columns { pane terminal=1; pane terminal=2 } } }");
+    let mut tui = Tui::start(&home, &[]);
+    tui.wait("two columns", |tui| {
+        tui.rows()[0].starts_with('$') && tui.rows()[0].contains("│$")
+    });
     tui.send("\x07");
-    tui.wait_text("panes");
+    tui.text_is("panes");
     tui.send("n");
-    // the label is the program: macOS runs sh as bash
-    tui.wait("a third pane", |tui| ["3 sh", "3 bash"].iter().any(|label| tui.text().contains(label)));
-    wait_state(&dir, "a third terminal", |state| state.contains("terminal 3"));
+    home.wait("third terminal", || home.read(1).contains("terminal 3"));
     tui.send("\r");
-    tui.wait("three columns", |tui| tui.rows()[0].matches('$').count() == 3);
-
-    // a shell ending well closes its pane: the plugin's update hook
+    tui.wait("three columns", |tui| {
+        tui.rows()[0].matches('$').count() == 3
+    });
     tui.send("exit\r");
-    wait_state(&dir, "two panes", |state| state.matches("pane terminal").count() == 2 && !state.contains("terminal 3"));
+    home.wait("successful exit closes pane", || {
+        !home.read(1).contains("terminal 3")
+    });
 
-    // attach from a shell inside: the running instance follows the file
-    let command = format!("{BIN} --state {} attach other\r", state(&dir).display());
-    tui.send(&command);
-    wait_state(&dir, "the other session", |state| state.contains("session other") && state.contains("attached 2"));
-    tui.wait("a fresh shell", |tui| tui.rows()[0].trim_end() == "$");
+    let mut watcher = Tui::start(&home, &["attach", "main"]);
+    watcher.wait("two columns", |tui| tui.rows()[0].contains("│$"));
+    tui.send(&format!("{BIN} attach other\r"));
+    home.wait("the other session", || {
+        home.read(2).contains("session other")
+    });
+    tui.wait("switched to other", |tui| tui.rows()[0].trim_end() == "$");
+    assert!(
+        watcher.rows()[0].contains("│$"),
+        "inside attach must not drag other viewers along"
+    );
+    watcher.detach("\x07");
+    tui.detach("\x07");
+}
 
-    tui.quit();
-    let _ = fs::remove_dir_all(&dir);
+#[test]
+fn last_typing_client_owns_shared_terminal_size() {
+    let home = Home::new("resize");
+    let mut a = Tui::start(&home, &[]);
+    a.prompt();
+    let mut b = Tui::start(&home, &[]);
+    b.prompt();
+    a.resize(20, 60);
+    a.send("stty size\r");
+    a.text_is("20 60");
+    b.text_is("20 60");
+    b.resize(25, 90);
+    b.send("stty size\r");
+    a.text_is("25 90");
+    b.text_is("25 90");
+    assert!(
+        !fs::read_to_string(home.global())
+            .unwrap()
+            .contains("message"),
+        "resize must not query a nonexistent server TTY"
+    );
+    a.detach("\x07");
+    b.detach("\x07");
+}
+
+#[test]
+fn repl_completes_then_requires_explicit_yes_even_with_apply() {
+    let home = Home::new("repl");
+    let mut cancelled = Tui::start(&home, &["--repl"]);
+    cancelled.text_is("Command");
+    cancelled.send("\r");
+    cancelled.text_is("Session");
+    cancelled.send("\x1b");
+    cancelled.text_is("Command");
+    cancelled.send("\r");
+    cancelled.text_is("Session");
+    cancelled.send("\r");
+    cancelled.text_is("Session name:");
+    cancelled.send("draft\r");
+    cancelled.text_is("Apply? (N/y)");
+    cancelled.send("\r");
+    cancelled.exited();
+    assert!(!home.global().exists());
+
+    let mut accepted = Tui::start(&home, &["--repl", "attach", "draft"]);
+    accepted.text_is("Apply? (N/y)");
+    assert!(!home.global().exists());
+    accepted.send("y\r");
+    accepted.prompt();
+    home.wait("session created", || home.read(1).contains("session draft"));
+    accepted.detach("\x07");
+    let pid = home.pid(1, 1).unwrap();
+
+    let mut no = Tui::start(&home, &["kill", "--repl", "--apply"]);
+    no.text_is("Apply? (N/y)");
+    no.send("n\r");
+    no.exited();
+    assert_eq!(home.pid(1, 1), Some(pid));
+    let mut yes = Tui::start(&home, &["kill", "--repl"]);
+    yes.text_is("Apply? (N/y)");
+    yes.send("y\r");
+    yes.exited();
+    home.wait("server stopped", || !home.read(1).contains("pid="));
+}
+
+#[test]
+fn shutdown_restarts_from_independent_session_states() {
+    let home = Home::new("restart");
+    let mut a = Tui::start(&home, &["attach", "main"]);
+    a.prompt();
+    let mut b = Tui::start(&home, &["attach", "other"]);
+    b.prompt();
+    let first = home.pid(1, 1).unwrap();
+    let second = home.pid(2, 1).unwrap();
+    assert!(
+        !home.command(&["server"]).status.success(),
+        "a second coordinator must not replace the owner"
+    );
+    // Each session file has a held owner lock, not one lock per client.
+    let lock = fs::File::open(home.session(1).with_file_name("state.kdl.lock")).unwrap();
+    assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
+    a.send("exit 5\r");
+    a.text_is("exited with 5");
+    home.wait("exit persisted", || home.read(1).contains("status=exited"));
+    home.stop();
+    a.exited();
+    b.exited();
+    home.wait("socket removed", || {
+        String::from_utf8_lossy(&home.command(&["kill"]).stdout).contains("no server")
+    });
+    assert_eq!(unsafe { libc::kill(first as i32, 0) }, -1);
+    assert_eq!(unsafe { libc::kill(second as i32, 0) }, -1);
+
+    let mut again = Tui::start(&home, &["attach", "main"]);
+    again.text_is("exited with 5");
+    let mut other = Tui::start(&home, &["attach", "other"]);
+    other.prompt();
+    assert_ne!(home.pid(2, 1), Some(second));
+    again.send("\r");
+    again.prompt();
+    assert_ne!(home.pid(1, 1), Some(first));
+    again.send("\x07");
+    again.text_is("panes");
+    again.send("Q");
+    again.exited();
+    other.exited();
+    home.wait("Q stops every owner", || {
+        !home.read(1).contains("pid=") && !home.read(2).contains("pid=")
+    });
+}
+
+#[test]
+fn kill_reaps_a_process_that_ignores_hangup() {
+    let home = Home::new("force-kill");
+    home.write(
+        &home.global(),
+        r#"session main {
+        terminal 1 command="/bin/sh" { args "-c" "trap '' HUP; printf READY; exec sleep 30" }
+        window { tab { pane terminal=1 } }
+    }"#,
+    );
+    let mut tui = Tui::start(&home, &[]);
+    tui.text_is("READY");
+    let pid = home.pid(1, 1).unwrap();
+    home.stop();
+    tui.exited();
+    assert_eq!(
+        unsafe { libc::kill(pid as i32, 0) },
+        -1,
+        "kill left the session's process running"
+    );
+}
+
+#[test]
+fn deleting_one_client_node_disconnects_only_that_instance() {
+    let home = Home::new("presence");
+    let mut a = Tui::start(&home, &[]);
+    a.prompt();
+    let mut b = Tui::start(&home, &[]);
+    b.prompt();
+    let pid = home.pid(1, 1).unwrap();
+    let text = fs::read_to_string(home.global()).unwrap();
+    let mut doc: kdl::KdlDocument = text.parse().unwrap();
+    let clients = doc
+        .get_mut("catalog")
+        .unwrap()
+        .children_mut()
+        .as_mut()
+        .unwrap()
+        .nodes_mut();
+    let index = clients
+        .iter()
+        .position(|node| node.name().value() == "client")
+        .unwrap();
+    clients.remove(index);
+    home.write(&home.global(), &doc.to_string());
+    a.exited();
+    b.send("echo still-here\r");
+    b.text_is("still-here");
+    assert_eq!(home.pid(1, 1), Some(pid));
+    b.detach("\x07");
+}
+
+#[test]
+fn lifecycle_commands_are_honest_read_only_placeholders() {
+    let home = Home::new("lifecycle");
+    for command in ["install", "update", "remove"] {
+        let output = home.ok(&[command, "--apply"]);
+        assert!(output.contains("more stable release") && output.contains("No changes made."));
+    }
+    assert!(!home.global().exists());
+    assert!(!home.config().exists());
+    assert!(home.ok(&["list"]).is_empty());
+    assert!(!home.global().exists());
+    assert!(!home.command(&["--unknown"]).status.success());
 }

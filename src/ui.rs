@@ -1,4 +1,4 @@
-//! Drawing: the view and the navigation panel, both derived from the state.
+//! Drawing: shared session state and client presence, styled by decoration.
 
 use std::cmp::Ordering;
 
@@ -11,19 +11,42 @@ use ratatui::{
     widgets::{Block, BorderType, Clear, Paragraph},
 };
 
+use crate::decoration::{Decoration, Theme};
 use crate::layout::{self, Container, Draw, Placement, Scene, Shown};
-use crate::runtime::{Runtime, lock};
+use crate::runtime::{Screens, lock};
 use crate::state::{Level, Location, Navigation, Nui, Operation, Status, Terminal};
 
-const HINTS: &str = "hjkl move  enter go  a add  r rename  x remove  s stop  esc back  q quit";
+fn hints(d: &Decoration) -> String {
+    format!(
+        "{}{}{}{} move  {} go  {} add  {} rename  {} remove  {} stop  {} back  {} detach  {} shutdown",
+        d.hint("left"),
+        d.hint("next"),
+        d.hint("previous"),
+        d.hint("right"),
+        d.hint("enter"),
+        d.hint("add"),
+        d.hint("rename"),
+        d.hint("remove"),
+        d.hint("stop"),
+        d.hint("back"),
+        d.hint("detach"),
+        d.hint("quit")
+    )
+}
 
 /// The view: the scene of the attached session, with the cursor of the
 /// focused pane.
-pub fn view(frame: &mut Frame, nui: &Nui, runtime: &Runtime, scene: &Scene) {
+pub fn view(
+    frame: &mut Frame,
+    nui: &Nui,
+    runtime: &impl Screens,
+    scene: &Scene,
+    decoration: &Decoration,
+) {
     let here = nui.location();
     for shown in &scene.panes {
         let focused = Some(shown.at) == here;
-        let cursor = pane(frame.buffer_mut(), nui, runtime, shown, focused);
+        let cursor = pane(frame.buffer_mut(), nui, runtime, shown, focused, decoration);
         if let Some(cursor) = cursor.filter(|_| focused) {
             frame.set_cursor_position(cursor);
         }
@@ -35,36 +58,77 @@ pub fn view(frame: &mut Frame, nui: &Nui, runtime: &Runtime, scene: &Scene) {
 pub fn navigation(
     frame: &mut Frame,
     nui: &Nui,
-    runtime: &Runtime,
+    runtime: &impl Screens,
+    decoration: &Decoration,
     place: &mut dyn FnMut(&str, &Container) -> Placement,
 ) {
-    let Some(navigation) = &nui.navigation else { return };
-    let [top, bottom] = Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(frame.area());
-    let [sections, status] = Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(top);
-    let columns = Layout::horizontal([Constraint::Fill(1); 4]).spacing(1).split(sections);
+    let Some(navigation) = &nui.navigation else {
+        return;
+    };
+    let [top, bottom] =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(frame.area());
+    let [sections, status] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(top);
+    let columns = Layout::horizontal([Constraint::Fill(1); 4])
+        .spacing(1)
+        .split(sections);
     let buffer = frame.buffer_mut();
     for (level, column) in Level::ALL.into_iter().zip(columns.iter()) {
-        section(buffer, nui, navigation, level, *column);
+        section(buffer, nui, navigation, level, *column, &decoration.theme);
     }
     for column in columns.iter().skip(1) {
         for y in column.top()..column.bottom() {
-            buffer[(column.x - 1, y)].set_symbol("│").set_fg(Color::DarkGray);
+            buffer[(column.x - 1, y)]
+                .set_symbol("│")
+                .set_fg(decoration.theme.muted);
         }
     }
     // the first line of a message: the rest, such as a traceback, stays in the state
-    match nui.message.as_deref().and_then(|message| message.lines().next()) {
-        Some(message) => buffer.set_stringn(status.x + 1, status.y, message, status.width as usize, Color::Yellow),
-        None => buffer.set_stringn(status.x + 1, status.y, HINTS, status.width as usize, Color::DarkGray),
+    match nui
+        .message
+        .as_deref()
+        .and_then(|message| message.lines().next())
+    {
+        Some(message) => buffer.set_stringn(
+            status.x + 1,
+            status.y,
+            message,
+            status.width as usize,
+            decoration.theme.notice,
+        ),
+        None => buffer.set_stringn(
+            status.x + 1,
+            status.y,
+            hints(decoration),
+            status.width as usize,
+            decoration.theme.muted,
+        ),
     };
-    preview(buffer, nui, runtime, navigation, bottom, place);
+    preview(buffer, nui, runtime, navigation, bottom, decoration, place);
     let column = columns[navigation.focus as usize];
     match &navigation.operation {
-        Some(Operation::Rename { input }) => prompt(frame, navigation, "Rename:", input, column, top),
+        Some(Operation::Rename { input }) => prompt(
+            frame,
+            navigation,
+            "Rename:",
+            input,
+            column,
+            top,
+            &decoration.theme,
+        ),
         Some(Operation::Create { input }) => {
             let title = format!("New {}:", navigation.focus.name());
-            prompt(frame, navigation, &title, input, column, top);
+            prompt(
+                frame,
+                navigation,
+                &title,
+                input,
+                column,
+                top,
+                &decoration.theme,
+            );
         }
-        Some(operation) => confirm(frame, nui, navigation, operation, top),
+        Some(operation) => confirm(frame, nui, navigation, operation, top, &decoration.theme),
         None => {}
     }
 }
@@ -72,29 +136,63 @@ pub fn navigation(
 /// A section: the title of its level and its items, the hovered one marked
 /// as yazi does: reversed in the focused section and the ones left of it,
 /// underlined in the ones right of it.
-fn section(buffer: &mut Buffer, nui: &Nui, navigation: &Navigation, level: Level, area: Rect) {
+fn section(
+    buffer: &mut Buffer,
+    nui: &Nui,
+    navigation: &Navigation,
+    level: Level,
+    area: Rect,
+    theme: &Theme,
+) {
     let title = match level {
         Level::Session => " sessions",
         Level::Window => " windows",
         Level::Tab => " tabs",
         Level::Pane => " panes",
     };
-    let title_style = if level == navigation.focus { Style::new().blue().bold() } else { Style::new().dark_gray() };
+    let title_style = if level == navigation.focus {
+        Style::new().fg(theme.accent).bold()
+    } else {
+        Style::new().fg(theme.muted)
+    };
     buffer.set_stringn(area.x, area.y, title, area.width as usize, title_style);
-    let list = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+    let list = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
     let hovered = navigation.cursor.get(level);
     let first = scroll(hovered, list.height);
-    for (row, index) in (first..nui.count(level, navigation.cursor)).enumerate().take(list.height as usize) {
-        let at = if index == hovered { navigation.cursor } else { nui.descend(level, navigation.cursor.with(level, index)) };
-        let line = Rect { y: list.y + row as u16, height: 1, ..list };
+    for (row, index) in (first..nui.count(level, navigation.cursor))
+        .enumerate()
+        .take(list.height as usize)
+    {
+        let at = if index == hovered {
+            navigation.cursor
+        } else {
+            nui.descend(level, navigation.cursor.with(level, index))
+        };
+        let line = Rect {
+            y: list.y + row as u16,
+            height: 1,
+            ..list
+        };
         if index == hovered {
-            buffer.set_style(line, match level.cmp(&navigation.focus) {
-                Ordering::Equal => Style::new().reversed().bold(),
-                Ordering::Less => Style::new().reversed(),
-                Ordering::Greater => Style::new().underlined(),
-            });
+            buffer.set_style(
+                line,
+                match level.cmp(&navigation.focus) {
+                    Ordering::Equal => Style::new().reversed().bold(),
+                    Ordering::Less => Style::new().reversed(),
+                    Ordering::Greater => Style::new().underlined(),
+                },
+            );
         }
-        buffer.set_line(line.x, line.y, &item(nui, level, at, index), line.width);
+        buffer.set_line(
+            line.x,
+            line.y,
+            &item(nui, level, at, index, theme),
+            line.width,
+        );
     }
 }
 
@@ -105,8 +203,12 @@ fn scroll(hovered: usize, height: u16) -> usize {
 
 /// An item: a dot when its parent shows it, its label, and whether its
 /// terminals run.
-fn item(nui: &Nui, level: Level, at: Location, index: usize) -> Line<'static> {
-    let dot = if nui.is_active(level, at) { Span::raw("●").green() } else { Span::raw(" ") };
+fn item(nui: &Nui, level: Level, at: Location, index: usize, theme: &Theme) -> Line<'static> {
+    let dot = if nui.is_active(level, at) {
+        Span::raw("●").fg(theme.active)
+    } else {
+        Span::raw(" ")
+    };
     let label = match level {
         Level::Session => nui.label(level, at),
         _ => format!("{} {}", index + 1, nui.label(level, at)),
@@ -114,16 +216,20 @@ fn item(nui: &Nui, level: Level, at: Location, index: usize) -> Line<'static> {
     let mut spans = vec![" ".into(), dot, " ".into(), label.into()];
     match nui.shown(at).filter(|_| level == Level::Pane) {
         Some(terminal) if terminal.status != Status::Running => {
-            let (text, color) = status(terminal);
+            let (text, color) = status(terminal, theme);
             spans.push(Span::styled(format!(" {text}"), color));
         }
         Some(_) => {}
         None => {
             let session = &nui.sessions[at.session];
             let inside = nui.terminals_in(level, at);
-            let running = |id: &u64| session.terminal(*id).is_some_and(|terminal| terminal.status == Status::Running);
+            let running = |id: &u64| {
+                session
+                    .terminal(*id)
+                    .is_some_and(|terminal| terminal.status == Status::Running)
+            };
             if !inside.is_empty() && !inside.iter().any(running) {
-                spans.push(" stopped".yellow());
+                spans.push(Span::styled(" stopped", theme.notice));
             }
         }
     }
@@ -135,27 +241,55 @@ fn item(nui: &Nui, level: Level, at: Location, index: usize) -> Line<'static> {
 fn preview(
     buffer: &mut Buffer,
     nui: &Nui,
-    runtime: &Runtime,
+    runtime: &impl Screens,
     navigation: &Navigation,
     area: Rect,
+    decoration: &Decoration,
     place: &mut dyn FnMut(&str, &Container) -> Placement,
 ) {
     if area.height < 2 {
         return;
     }
-    buffer.set_string(area.x, area.y, "─".repeat(area.width as usize), Style::new().dark_gray());
-    let name = format!(" {} {} ", navigation.focus.name(), nui.label(navigation.focus, navigation.cursor));
-    buffer.set_stringn(area.x + 1, area.y, name, area.width.saturating_sub(2) as usize, Style::new().blue());
-    let inner = Rect { y: area.y + 1, height: area.height - 1, ..area };
+    buffer.set_string(
+        area.x,
+        area.y,
+        "─".repeat(area.width as usize),
+        Style::new().fg(decoration.theme.muted),
+    );
+    let name = format!(
+        " {} {} ",
+        navigation.focus.name(),
+        nui.label(navigation.focus, navigation.cursor)
+    );
+    buffer.set_stringn(
+        area.x + 1,
+        area.y,
+        name,
+        area.width.saturating_sub(2) as usize,
+        Style::new().fg(decoration.theme.accent),
+    );
+    let inner = Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    };
     let scene = layout::scene(nui, navigation.focus, navigation.cursor, inner, place);
     for shown in &scene.panes {
-        pane(buffer, nui, runtime, shown, false);
+        pane(buffer, nui, runtime, shown, false, decoration);
     }
     draws(buffer, &scene.draws);
 }
 
 /// The input of a name, under the hovered item as in yazi.
-fn prompt(frame: &mut Frame, navigation: &Navigation, title: &str, input: &str, column: Rect, top: Rect) {
+fn prompt(
+    frame: &mut Frame,
+    navigation: &Navigation,
+    title: &str,
+    input: &str,
+    column: Rect,
+    top: Rect,
+    theme: &Theme,
+) {
     let screen = frame.area();
     let hovered = navigation.cursor.get(navigation.focus);
     let row = column.y + 1 + (hovered - scroll(hovered, column.height.saturating_sub(1))) as u16;
@@ -167,15 +301,31 @@ fn prompt(frame: &mut Frame, navigation: &Navigation, title: &str, input: &str, 
     }
     // the end of a long input stays in sight
     let room = width.saturating_sub(3) as usize;
-    let shown: String = input.chars().skip(input.chars().count().saturating_sub(room)).collect();
-    let cursor = Position::new(popup.x + 1 + Line::raw(shown.as_str()).width() as u16, popup.y + 1);
+    let shown: String = input
+        .chars()
+        .skip(input.chars().count().saturating_sub(room))
+        .collect();
+    let cursor = Position::new(
+        popup.x + 1 + Line::raw(shown.as_str()).width() as u16,
+        popup.y + 1,
+    );
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(shown).block(popup_block(title)), popup);
+    frame.render_widget(
+        Paragraph::new(shown).block(popup_block(title, theme)),
+        popup,
+    );
     frame.set_cursor_position(cursor);
 }
 
 /// The question of a removal or a stop, centered.
-fn confirm(frame: &mut Frame, nui: &Nui, navigation: &Navigation, operation: &Operation, top: Rect) {
+fn confirm(
+    frame: &mut Frame,
+    nui: &Nui,
+    navigation: &Navigation,
+    operation: &Operation,
+    top: Rect,
+    theme: &Theme,
+) {
     let (focus, cursor) = (navigation.focus, navigation.cursor);
     let what = format!("{} {}", focus.name(), nui.label(focus, cursor));
     let (title, question) = match operation {
@@ -184,77 +334,144 @@ fn confirm(frame: &mut Frame, nui: &Nui, navigation: &Navigation, operation: &Op
         _ => {
             let session = &nui.sessions[cursor.session];
             let inside = nui.terminals_in(focus, cursor);
-            let running = inside.iter().filter_map(|id| session.terminal(*id)).filter(|t| t.status == Status::Running);
-            ("Stop?", format!("Stop {what}: {} running terminal(s)?", running.count()))
+            let running = inside
+                .iter()
+                .filter_map(|id| session.terminal(*id))
+                .filter(|t| t.status == Status::Running);
+            (
+                "Stop?",
+                format!("Stop {what}: {} running terminal(s)?", running.count()),
+            )
         }
     };
-    let width = (Line::raw(question.as_str()).width() as u16 + 4).max(34).min(top.width);
+    let width = (Line::raw(question.as_str()).width() as u16 + 4)
+        .max(34)
+        .min(top.width);
     let height = 5.min(top.height);
-    let popup = Rect::new(top.x + (top.width - width) / 2, top.y + (top.height - height) / 2, width, height);
+    let popup = Rect::new(
+        top.x + (top.width - width) / 2,
+        top.y + (top.height - height) / 2,
+        width,
+        height,
+    );
     if popup.height < 3 {
         return;
     }
-    let lines = vec![Line::raw(question), Line::raw(""), Line::raw("enter: confirm   esc: cancel").dark_gray()];
+    let lines = vec![
+        Line::raw(question),
+        Line::raw(""),
+        Line::raw("enter: confirm   esc: cancel").fg(theme.muted),
+    ];
     frame.render_widget(Clear, popup);
-    frame.render_widget(Paragraph::new(lines).centered().block(popup_block(title)), popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .centered()
+            .block(popup_block(title, theme)),
+        popup,
+    );
 }
 
-fn popup_block(title: &str) -> Block<'_> {
-    Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().blue()).title(title)
+fn popup_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::new().fg(theme.accent))
+        .title(title)
 }
 
 /// A pane: the screen of its terminal, with a badge when it doesn't run,
 /// telling what to do in the focused one. Returns the cursor of the terminal,
 /// when in sight.
-fn pane(buffer: &mut Buffer, nui: &Nui, runtime: &Runtime, shown: &Shown, focused: bool) -> Option<Position> {
+fn pane(
+    buffer: &mut Buffer,
+    nui: &Nui,
+    runtime: &impl Screens,
+    shown: &Shown,
+    focused: bool,
+    decoration: &Decoration,
+) -> Option<Position> {
     let terminal = nui.shown(shown.at)?;
     let running = terminal.status == Status::Running;
-    let cursor = runtime.screen(terminal.id).and_then(|screen| {
-        let parser = lock(screen);
-        let cursor = draw_screen(buffer, shown.area, parser.screen(), !running);
-        cursor.filter(|_| running && !parser.screen().hide_cursor())
-    });
+    let cursor = runtime
+        .screen_at(shown.at.session, terminal.id)
+        .and_then(|screen| {
+            let parser = lock(screen);
+            let cursor = draw_screen(buffer, shown.area, parser.screen(), !running);
+            cursor.filter(|_| running && !parser.screen().hide_cursor())
+        });
     if !running {
-        let (text, color) = status(terminal);
-        let hint = if focused { format!(" · enter: restart · {}: panel", nui.toggle) } else { String::new() };
+        let (text, color) = status(terminal, &decoration.theme);
+        let hint = if focused {
+            format!(
+                " · {}: restart · {}: panel",
+                decoration.hint("restart"),
+                decoration.hint("panel")
+            )
+        } else {
+            String::new()
+        };
         let badge = format!(" {} {text}{hint} ", terminal.program_name());
         let width = Line::raw(badge.as_str()).width() as u16;
         let x = shown.area.right().saturating_sub(width).max(shown.area.x);
-        buffer.set_stringn(x, shown.area.y, badge, shown.area.width as usize, Style::new().black().bg(color));
+        buffer.set_stringn(
+            x,
+            shown.area.y,
+            badge,
+            shown.area.width as usize,
+            Style::new().black().bg(color),
+        );
     }
     cursor
 }
 
 /// How a terminal is, in words and color: an exit is an error only with a
 /// code telling so.
-fn status(terminal: &Terminal) -> (String, Color) {
+fn status(terminal: &Terminal, theme: &Theme) -> (String, Color) {
     match (terminal.status, terminal.exit) {
-        (Status::Running, _) => ("running".into(), Color::Green),
-        (Status::Stopped, _) => ("stopped".into(), Color::Yellow),
+        (Status::Running, _) => ("running".into(), theme.active),
+        (Status::Stopped, _) => ("stopped".into(), theme.notice),
         (Status::Exited, Some(0)) => ("exited".into(), Color::Gray),
-        (Status::Exited, Some(code)) => (format!("exited with {code}"), Color::Red),
-        (Status::Exited, None) => ("failed to start".into(), Color::Red),
+        (Status::Exited, Some(code)) => (format!("exited with {code}"), theme.error),
+        (Status::Exited, None) => ("failed to start".into(), theme.error),
     }
 }
 
 /// Draw a terminal screen in an area. A taller screen shows its rows down to
 /// the cursor; returns where the cursor is, when inside the area.
-fn draw_screen(buffer: &mut Buffer, area: Rect, screen: &vt100::Screen, dim: bool) -> Option<Position> {
+fn draw_screen(
+    buffer: &mut Buffer,
+    area: Rect,
+    screen: &vt100::Screen,
+    dim: bool,
+) -> Option<Position> {
     let (rows, cols) = (screen.size().0.get(), screen.size().1.get());
     let (cursor_row, cursor_col) = screen.cursor_position();
-    let top = if rows > area.height { (cursor_row + 1).saturating_sub(area.height).min(rows - area.height) } else { 0 };
+    let top = if rows > area.height {
+        (cursor_row + 1)
+            .saturating_sub(area.height)
+            .min(rows - area.height)
+    } else {
+        0
+    };
     for y in 0..area.height.min(rows - top) {
         let mut x = 0;
         while x < area.width.min(cols) {
-            let Some(cell) = screen.cell(top + y, x) else { break };
+            let Some(cell) = screen.cell(top + y, x) else {
+                break;
+            };
             let position = (area.x + x, area.y + y);
             if cell.is_wide() && x + 1 >= area.width {
                 // no room for the second half of a wide character
                 buffer[position].reset();
                 break;
             }
-            let symbol = if cell.has_contents() { cell.contents() } else { " " };
-            buffer[position].set_symbol(symbol).set_style(cell_style(cell, dim));
+            let symbol = if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            };
+            buffer[position]
+                .set_symbol(symbol)
+                .set_style(cell_style(cell, dim));
             if cell.is_wide() {
                 buffer[(position.0 + 1, position.1)].reset();
                 x += 2;
@@ -280,7 +497,10 @@ fn cell_style(cell: &vt100::Cell, dim: bool) -> Style {
             modifier |= flag;
         }
     }
-    Style::new().fg(color(cell.fgcolor())).bg(color(cell.bgcolor())).add_modifier(modifier)
+    Style::new()
+        .fg(color(cell.fgcolor()))
+        .bg(color(cell.bgcolor()))
+        .add_modifier(modifier)
 }
 
 fn color(color: vt100::Color) -> Color {
@@ -305,6 +525,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+    use crate::runtime::Runtime;
     use crate::state::tests::sample;
 
     #[test]
@@ -313,8 +534,12 @@ mod tests {
         let runtime = Runtime::new(events, (24, 80));
         let operations = [
             None,
-            Some(Operation::Rename { input: "x".repeat(50) }),
-            Some(Operation::Create { input: String::new() }),
+            Some(Operation::Rename {
+                input: "x".repeat(50),
+            }),
+            Some(Operation::Create {
+                input: String::new(),
+            }),
             Some(Operation::Remove),
             Some(Operation::Stop),
         ];
@@ -322,9 +547,23 @@ mod tests {
             for operation in operations.clone() {
                 for focus in Level::ALL {
                     let mut nui = sample();
-                    nui.navigation = Some(Navigation { focus, cursor: Location::default(), operation: operation.clone() });
+                    nui.navigation = Some(Navigation {
+                        focus,
+                        cursor: Location::default(),
+                        operation: operation.clone(),
+                    });
                     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                    terminal.draw(|frame| navigation(frame, &nui, &runtime, &mut |_, c| layout::tabs(c))).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            navigation(
+                                frame,
+                                &nui,
+                                &runtime,
+                                &Decoration::default(),
+                                &mut |_, c| layout::tabs(c),
+                            )
+                        })
+                        .unwrap();
                 }
             }
         }
@@ -336,13 +575,26 @@ mod tests {
         let runtime = Runtime::new(events, (24, 80));
         let mut nui = sample();
         let area = Rect::new(0, 0, 80, 3);
-        for (exit, badge) in [(0, " sh exited · enter: restart · ctrl-g: panel "), (2, " sh exited with 2 · ")] {
+        for (exit, badge) in [
+            (0, " sh exited · enter: restart · ctrl-g: panel "),
+            (2, " sh exited with 2 · "),
+        ] {
             let shown = &mut nui.sessions[0].terminals[0];
             (shown.status, shown.exit) = (Status::Exited, Some(exit));
-            let scene = layout::scene(&nui, Level::Session, Location::default(), area, &mut |_, c| layout::tabs(c));
+            let scene = layout::scene(
+                &nui,
+                Level::Session,
+                Location::default(),
+                area,
+                &mut |_, c| layout::tabs(c),
+            );
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-            terminal.draw(|frame| view(frame, &nui, &runtime, &scene)).unwrap();
-            let top: String = (0..area.width).map(|x| terminal.backend().buffer()[(x, 0)].symbol()).collect();
+            terminal
+                .draw(|frame| view(frame, &nui, &runtime, &scene, &Decoration::default()))
+                .unwrap();
+            let top: String = (0..area.width)
+                .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+                .collect();
             assert!(top.contains(badge), "{top}");
         }
     }

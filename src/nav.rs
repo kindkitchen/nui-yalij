@@ -12,12 +12,17 @@ use crate::state::{Level, Location, Navigation, Nui, Operation};
 pub enum Outcome {
     Stay,
     Quit,
+    Shutdown,
 }
 
 /// Open the panel at the location of the person.
 pub fn open(nui: &mut Nui) {
     if let Some(cursor) = nui.location() {
-        nui.navigation = Some(Navigation { focus: Level::Pane, cursor, operation: None });
+        nui.navigation = Some(Navigation {
+            focus: Level::Pane,
+            cursor,
+            operation: None,
+        });
     }
 }
 
@@ -28,30 +33,43 @@ pub fn close(nui: &mut Nui) {
 
 /// Handle a key of the panel; new terminals run `shell`.
 pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
-    let Some(Navigation { focus, cursor, operation }) = nui.navigation.clone() else { return Outcome::Stay };
+    let Some(Navigation {
+        focus,
+        cursor,
+        operation,
+    }) = nui.navigation.clone()
+    else {
+        return Outcome::Stay;
+    };
     nui.message = None;
     match operation {
-        Some(mut operation @ (Operation::Rename { .. } | Operation::Create { .. })) => match key.code {
-            KeyCode::Esc => set_operation(nui, None),
-            KeyCode::Enter => {
-                if let Err(error) = approve(nui, focus, cursor, operation) {
-                    nui.message = Some(error);
+        Some(mut operation @ (Operation::Rename { .. } | Operation::Create { .. })) => {
+            match key.code {
+                KeyCode::Esc => set_operation(nui, None),
+                KeyCode::Enter => {
+                    if let Err(error) = approve(nui, focus, cursor, operation) {
+                        nui.message = Some(error);
+                    }
                 }
-            }
-            KeyCode::Backspace => {
-                if let Some(input) = operation.input_mut() {
-                    input.pop();
+                KeyCode::Backspace => {
+                    if let Some(input) = operation.input_mut() {
+                        input.pop();
+                    }
+                    set_operation(nui, Some(operation));
                 }
-                set_operation(nui, Some(operation));
-            }
-            KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                if let Some(input) = operation.input_mut() {
-                    input.push(c);
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    if let Some(input) = operation.input_mut() {
+                        input.push(c);
+                    }
+                    set_operation(nui, Some(operation));
                 }
-                set_operation(nui, Some(operation));
+                _ => {}
             }
-            _ => {}
-        },
+        }
         Some(operation) => match key.code {
             KeyCode::Esc => set_operation(nui, None),
             KeyCode::Enter => {
@@ -87,6 +105,7 @@ pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
                 close(nui);
                 return Outcome::Quit;
             }
+            KeyCode::Char('Q') => return Outcome::Shutdown,
             _ => {}
         },
     }
@@ -95,7 +114,10 @@ pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
 
 /// Pasted text goes into a name being typed, as typed.
 pub fn paste(nui: &mut Nui, text: &str) {
-    let operation = nui.navigation.as_mut().and_then(|navigation| navigation.operation.as_mut());
+    let operation = nui
+        .navigation
+        .as_mut()
+        .and_then(|navigation| navigation.operation.as_mut());
     if let Some(input) = operation.and_then(Operation::input_mut) {
         input.extend(text.chars().filter(|c| !c.is_control()));
     }
@@ -105,22 +127,33 @@ pub fn paste(nui: &mut Nui, text: &str) {
 /// is, and name it.
 fn create(nui: &mut Nui, focus: Level, cursor: Location, shell: &str) {
     let cwd = nui.shown(cursor).and_then(|terminal| terminal.cwd.clone());
-    let Some(at) = nui.create(focus, cursor, shell, cwd) else { return };
+    let Some(at) = nui.create(focus, cursor, shell, cwd) else {
+        return;
+    };
     if let Some(navigation) = nui.navigation.as_mut() {
         navigation.cursor = at;
-        navigation.operation = Some(Operation::Create { input: String::new() });
+        navigation.operation = Some(Operation::Create {
+            input: String::new(),
+        });
     }
 }
 
 /// Give the hovered item the typed name. A new one keeps its automatic name
 /// when none is typed, and the first item inside it is named next.
-fn approve(nui: &mut Nui, focus: Level, cursor: Location, operation: Operation) -> Result<(), String> {
+fn approve(
+    nui: &mut Nui,
+    focus: Level,
+    cursor: Location,
+    operation: Operation,
+) -> Result<(), String> {
     let next = match operation {
         Operation::Create { input } => {
             if !input.trim().is_empty() {
                 nui.rename(focus, cursor, &input)?;
             }
-            (focus < Level::Pane).then(|| Operation::Create { input: String::new() })
+            (focus < Level::Pane).then(|| Operation::Create {
+                input: String::new(),
+            })
         }
         Operation::Rename { input } => {
             nui.rename(focus, cursor, &input)?;
@@ -153,7 +186,9 @@ fn move_focus(nui: &mut Nui, delta: isize) {
 /// Hover the item `delta` steps down in the focused section; the sections to
 /// the right follow it, to its active children.
 fn move_cursor(nui: &mut Nui, delta: isize) {
-    let Some(Navigation { focus, cursor, .. }) = nui.navigation.clone() else { return };
+    let Some(Navigation { focus, cursor, .. }) = nui.navigation.clone() else {
+        return;
+    };
     let last = nui.count(focus, cursor).saturating_sub(1) as isize;
     let index = (cursor.get(focus) as isize + delta).clamp(0, last) as usize;
     let cursor = nui.descend(focus, cursor.with(focus, index));
@@ -166,7 +201,10 @@ fn move_cursor(nui: &mut Nui, delta: isize) {
 /// unnamed unless typed.
 fn name(nui: &Nui, level: Level, at: Location) -> String {
     let name = match level {
-        Level::Session => nui.sessions.get(at.session).map(|session| session.name.clone()),
+        Level::Session => nui
+            .sessions
+            .get(at.session)
+            .map(|session| session.name.clone()),
         Level::Window => nui.window(at).and_then(|window| window.name.clone()),
         Level::Tab => nui.tab(at).and_then(|tab| tab.name.clone()),
         Level::Pane => nui.pane(at).and_then(|pane| pane.name.clone()),
@@ -205,13 +243,28 @@ mod tests {
         assert_eq!(cursor(&nui), (Level::Pane, Location::default()));
         press(&mut nui, "hhj");
         // the second window, and its active tab and pane
-        assert_eq!(cursor(&nui), (Level::Window, Location { window: 1, ..Location::default() }));
+        assert_eq!(
+            cursor(&nui),
+            (
+                Level::Window,
+                Location {
+                    window: 1,
+                    ..Location::default()
+                }
+            )
+        );
         press(&mut nui, "jjjk");
         assert_eq!(cursor(&nui).1.window, 0);
         // enter on a window moves to its tabs; on a pane, into the pane
         press(&mut nui, "\nj\n\n");
         assert!(nui.navigation.is_none());
-        assert_eq!(nui.location(), Some(Location { tab: 1, ..Location::default() }));
+        assert_eq!(
+            nui.location(),
+            Some(Location {
+                tab: 1,
+                ..Location::default()
+            })
+        );
     }
 
     #[test]
@@ -232,12 +285,37 @@ mod tests {
         // a session after the hovered one, then its window, named; esc keeps
         // the automatic names of the rest
         press(&mut nui, "hhhawork\ndev\n\x1b");
-        assert_eq!(cursor(&nui), (Level::Tab, Location { session: 1, ..Location::default() }));
-        assert_eq!(names(&nui, cursor(&nui).1), ["work", "dev", "tab-1", "pane-1"]);
+        assert_eq!(
+            cursor(&nui),
+            (
+                Level::Tab,
+                Location {
+                    session: 1,
+                    ..Location::default()
+                }
+            )
+        );
+        assert_eq!(
+            names(&nui, cursor(&nui).1),
+            ["work", "dev", "tab-1", "pane-1"]
+        );
         // no name keeps the automatic one, and goes on
         press(&mut nui, "a\n\n");
-        assert_eq!(cursor(&nui), (Level::Pane, Location { session: 1, tab: 1, ..Location::default() }));
-        assert_eq!(names(&nui, cursor(&nui).1), ["work", "dev", "tab-2", "pane-1"]);
+        assert_eq!(
+            cursor(&nui),
+            (
+                Level::Pane,
+                Location {
+                    session: 1,
+                    tab: 1,
+                    ..Location::default()
+                }
+            )
+        );
+        assert_eq!(
+            names(&nui, cursor(&nui).1),
+            ["work", "dev", "tab-2", "pane-1"]
+        );
         assert!(nui.navigation.as_ref().unwrap().operation.is_none());
         // a session needs a name of its own
         press(&mut nui, "hhhamain\n");

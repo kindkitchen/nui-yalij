@@ -1,9 +1,8 @@
-//! The Nui state in KDL: the format of the state file.
+//! Session state in KDL. The decoder also reads the legacy aggregate shape
+//! below for migration; new persistence uses encode_session, without presence.
 //!
 //! ```kdl
-//! toggle "ctrl-g"
 //! attached 1
-//! plugin "plugins/example.lua"
 //! session "main" active=1 {
 //!     terminal 1 command="/bin/zsh" cwd="/home/me" pid=4242 program="vim"
 //!     window {
@@ -24,27 +23,44 @@
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use crate::state::{
-    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session, Status, Tab, Terminal, Window,
+    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session, Status, Tab,
+    Terminal, Window,
 };
 
 const HEADER: &str = "// nui-yalij state: the single source of truth, applied live when changed.\n";
 
-/// The state as a KDL document.
+/// Aggregate projection codec, used to verify legacy/Lua-compatible shapes.
+#[cfg(test)]
 pub fn encode(nui: &Nui) -> String {
     let mut document = KdlDocument::new();
     let nodes = document.nodes_mut();
-    nodes.push(node("toggle").arg(nui.toggle.as_str()).0);
     nodes.push(node("attached").arg(index(nui.attached)).0);
-    nodes.extend(nui.plugins.iter().map(|plugin| node("plugin").arg(plugin.as_str()).0));
     nodes.extend(nui.sessions.iter().map(session));
     nodes.extend(nui.navigation.as_ref().map(navigation));
-    nodes.extend(nui.message.as_deref().map(|message| node("message").arg(message).0));
+    nodes.extend(
+        nui.message
+            .as_deref()
+            .map(|message| node("message").arg(message).0),
+    );
+    document.autoformat();
+    format!("{HEADER}{document}")
+}
+
+pub fn encode_session(state: &Session) -> String {
+    let mut document = KdlDocument::new();
+    document.nodes_mut().push(session(state));
     document.autoformat();
     format!("{HEADER}{document}")
 }
 
 fn session(session: &Session) -> KdlNode {
-    let mut node = container(node("session").arg(session.name.as_str()), &session.layout, session.active);
+    let mut node = container(
+        node("session")
+            .arg(session.name.as_str())
+            .prop("id", session.id as i128),
+        &session.layout,
+        session.active,
+    );
     for terminal in &session.terminals {
         node = node.child(self::terminal(terminal));
     }
@@ -53,7 +69,11 @@ fn session(session: &Session) -> KdlNode {
         for tab in &window.tabs {
             let mut grandchild = container(named("tab", &tab.name), &tab.layout, tab.active);
             for pane in &tab.panes {
-                grandchild = grandchild.child(named("pane", &pane.name).prop("terminal", pane.terminal as i128).0);
+                grandchild = grandchild.child(
+                    named("pane", &pane.name)
+                        .prop("terminal", pane.terminal as i128)
+                        .0,
+                );
             }
             child = child.child(grandchild.0);
         }
@@ -76,21 +96,28 @@ fn terminal(terminal: &Terminal) -> KdlNode {
         .option("program", terminal.program.as_deref())
         .option("title", terminal.title.as_deref());
     if !terminal.args.is_empty() {
-        let args = terminal.args.iter().fold(self::node("args"), |args, arg| args.arg(arg.as_str()));
+        let args = terminal
+            .args
+            .iter()
+            .fold(self::node("args"), |args, arg| args.arg(arg.as_str()));
         node = node.child(args.0);
     }
     node.0
 }
 
-fn navigation(navigation: &Navigation) -> KdlNode {
+pub(crate) fn navigation(navigation: &Navigation) -> KdlNode {
     let cursor = navigation.cursor;
     let mut node = node("navigation").prop("focus", navigation.focus.name());
     for level in Level::ALL {
         node = node.prop(level.name(), index(cursor.get(level)));
     }
     match &navigation.operation {
-        Some(Operation::Rename { input }) => node = node.child(self::node("rename").arg(input.as_str()).0),
-        Some(Operation::Create { input }) => node = node.child(self::node("create").arg(input.as_str()).0),
+        Some(Operation::Rename { input }) => {
+            node = node.child(self::node("rename").arg(input.as_str()).0)
+        }
+        Some(Operation::Create { input }) => {
+            node = node.child(self::node("create").arg(input.as_str()).0)
+        }
         Some(Operation::Remove) => node = node.child(self::node("remove").0),
         Some(Operation::Stop) => node = node.child(self::node("stop").0),
         None => {}
@@ -129,19 +156,19 @@ fn index(index: usize) -> i128 {
 }
 
 /// A node under construction.
-struct Node(KdlNode);
+pub(crate) struct Node(pub KdlNode);
 
-fn node(name: &str) -> Node {
+pub(crate) fn node(name: &str) -> Node {
     Node(KdlNode::new(name))
 }
 
 impl Node {
-    fn arg(mut self, value: impl Into<KdlValue>) -> Node {
+    pub(crate) fn arg(mut self, value: impl Into<KdlValue>) -> Node {
         self.0.push(KdlEntry::new(value));
         self
     }
 
-    fn prop(mut self, key: &str, value: impl Into<KdlValue>) -> Node {
+    pub(crate) fn prop(mut self, key: &str, value: impl Into<KdlValue>) -> Node {
         self.0.push(KdlEntry::new_prop(key, value));
         self
     }
@@ -153,7 +180,7 @@ impl Node {
         }
     }
 
-    fn child(mut self, child: KdlNode) -> Node {
+    pub(crate) fn child(mut self, child: KdlNode) -> Node {
         self.0.ensure_children().nodes_mut().push(child);
         self
     }
@@ -163,8 +190,17 @@ impl Node {
 pub fn decode(text: &str) -> Result<Nui, String> {
     let document: KdlDocument = text.parse().map_err(|error: kdl::KdlError| {
         let diagnostics = error.diagnostics.iter().map(|diagnostic| {
-            let line = text.chars().take(diagnostic.span.offset()).filter(|&c| c == '\n').count() + 1;
-            let what = diagnostic.message.as_deref().or(diagnostic.label.as_deref()).unwrap_or("invalid KDL");
+            let line = text
+                .chars()
+                .take(diagnostic.span.offset())
+                .filter(|&c| c == '\n')
+                .count()
+                + 1;
+            let what = diagnostic
+                .message
+                .as_deref()
+                .or(diagnostic.label.as_deref())
+                .unwrap_or("invalid KDL");
             format!("line {line}: {what}")
         });
         diagnostics.collect::<Vec<_>>().join("; ")
@@ -177,11 +213,19 @@ pub fn decode(text: &str) -> Result<Nui, String> {
             decoder.read(node, &[])
         };
         match node.name().value() {
-            "toggle" => nui.toggle = simple()?.string_arg()?,
+            // Legacy configuration is deliberately not part of state anymore.
+            "toggle" | "plugin" => {
+                simple()?.string_arg()?;
+            }
             "attached" => nui.attached = simple()?.index_arg()?,
-            "plugin" => nui.plugins.push(simple()?.string_arg()?),
             "message" => nui.message = Some(simple()?.string_arg()?),
-            "session" => nui.sessions.push(decoder.session(node)?),
+            "session" => {
+                let mut session = decoder.session(node)?;
+                if session.id == 0 {
+                    session.id = nui.next_session_id();
+                }
+                nui.sessions.push(session);
+            }
             "navigation" => nui.navigation = Some(decoder.navigation(node)?),
             other => return Err(decoder.error(node, &format!("unknown node {other}"))),
         }
@@ -203,7 +247,11 @@ struct Entries<'a> {
 impl<'a> Decoder<'a> {
     fn error(&self, node: &KdlNode, message: &str) -> String {
         let offset = node.span().offset().min(self.text.len());
-        let line = self.text.as_bytes()[..offset].iter().filter(|&&b| b == b'\n').count() + 1;
+        let line = self.text.as_bytes()[..offset]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+            + 1;
         format!("line {line}, {}: {message}", node.name().value())
     }
 
@@ -214,23 +262,36 @@ impl<'a> Decoder<'a> {
             match entry.name() {
                 None => args.push(entry.value()),
                 Some(key) if props.contains(&key.value()) => {}
-                Some(key) => return Err(self.error(node, &format!("unknown property {}", key.value()))),
+                Some(key) => {
+                    return Err(self.error(node, &format!("unknown property {}", key.value())));
+                }
             }
         }
-        Ok(Entries { decoder: self, node, args })
+        Ok(Entries {
+            decoder: self,
+            node,
+            args,
+        })
     }
 
     fn children(&self, node: &'a KdlNode, allowed: &[&str]) -> Result<Vec<&'a KdlNode>, String> {
-        let children: Vec<&KdlNode> = node.children().map(|document| document.nodes().iter().collect()).unwrap_or_default();
-        match children.iter().find(|child| !allowed.contains(&child.name().value())) {
+        let children: Vec<&KdlNode> = node
+            .children()
+            .map(|document| document.nodes().iter().collect())
+            .unwrap_or_default();
+        match children
+            .iter()
+            .find(|child| !allowed.contains(&child.name().value()))
+        {
             Some(child) => Err(self.error(child, "unknown node here")),
             None => Ok(children),
         }
     }
 
     fn session(&self, node: &KdlNode) -> Result<Session, String> {
-        let entries = self.read(node, &["layout", "active"])?;
+        let entries = self.read(node, &["id", "layout", "active"])?;
         let mut session = Session {
+            id: entries.number("id")?.unwrap_or(0),
             name: entries.string_arg()?,
             layout: entries.layout()?,
             active: entries.index("active")?.unwrap_or(0),
@@ -247,7 +308,10 @@ impl<'a> Decoder<'a> {
 
     fn window(&self, node: &KdlNode) -> Result<Window, String> {
         let entries = self.read(node, &["layout", "active"])?;
-        let tabs = self.children(node, &["tab"])?.into_iter().map(|child| self.tab(child));
+        let tabs = self
+            .children(node, &["tab"])?
+            .into_iter()
+            .map(|child| self.tab(child));
         Ok(Window {
             name: entries.optional_string_arg()?,
             layout: entries.layout()?,
@@ -258,7 +322,10 @@ impl<'a> Decoder<'a> {
 
     fn tab(&self, node: &KdlNode) -> Result<Tab, String> {
         let entries = self.read(node, &["layout", "active"])?;
-        let panes = self.children(node, &["pane"])?.into_iter().map(|child| self.pane(child));
+        let panes = self
+            .children(node, &["pane"])?
+            .into_iter()
+            .map(|child| self.pane(child));
         Ok(Tab {
             name: entries.optional_string_arg()?,
             layout: entries.layout()?,
@@ -270,14 +337,26 @@ impl<'a> Decoder<'a> {
     fn pane(&self, node: &KdlNode) -> Result<Pane, String> {
         let entries = self.read(node, &["terminal"])?;
         self.children(node, &[])?;
-        let terminal = entries.number("terminal")?.ok_or_else(|| self.error(node, "terminal=<id> is missing"))?;
-        Ok(Pane { name: entries.optional_string_arg()?, terminal })
+        let terminal = entries
+            .number("terminal")?
+            .ok_or_else(|| self.error(node, "terminal=<id> is missing"))?;
+        Ok(Pane {
+            name: entries.optional_string_arg()?,
+            terminal,
+        })
     }
 
     fn terminal(&self, node: &KdlNode) -> Result<Terminal, String> {
-        let entries = self.read(node, &["command", "cwd", "status", "exit", "pid", "program", "title"])?;
+        let entries = self.read(
+            node,
+            &[
+                "command", "cwd", "status", "exit", "pid", "program", "title",
+            ],
+        )?;
         let id = match entries.args.as_slice() {
-            [KdlValue::Integer(id)] => u64::try_from(*id).map_err(|_| self.error(node, "the id should be positive"))?,
+            [KdlValue::Integer(id)] => {
+                u64::try_from(*id).map_err(|_| self.error(node, "the id should be positive"))?
+            }
             _ => return Err(self.error(node, "one argument expected: the id")),
         };
         let status = match entries.string("status")?.as_deref() {
@@ -288,11 +367,19 @@ impl<'a> Decoder<'a> {
         };
         let mut args = Vec::new();
         for child in self.children(node, &["args"])? {
-            args.extend(self.read(child, &[])?.args.iter().map(|arg| string(self, child, arg)).collect::<Result<Vec<_>, _>>()?);
+            args.extend(
+                self.read(child, &[])?
+                    .args
+                    .iter()
+                    .map(|arg| string(self, child, arg))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         Ok(Terminal {
             id,
-            command: entries.string("command")?.ok_or_else(|| self.error(node, "command=<program> is missing"))?,
+            command: entries
+                .string("command")?
+                .ok_or_else(|| self.error(node, "command=<program> is missing"))?,
             args,
             cwd: entries.string("cwd")?,
             status,
@@ -306,7 +393,8 @@ impl<'a> Decoder<'a> {
     fn navigation(&self, node: &KdlNode) -> Result<Navigation, String> {
         let entries = self.read(node, &["focus", "session", "window", "tab", "pane"])?;
         let focus = entries.string("focus")?.unwrap_or_else(|| "pane".into());
-        let focus = Level::parse(&focus).ok_or_else(|| self.error(node, &format!("unknown focus {focus}")))?;
+        let focus = Level::parse(&focus)
+            .ok_or_else(|| self.error(node, &format!("unknown focus {focus}")))?;
         let mut cursor = Location::default();
         for level in Level::ALL {
             cursor.set(level, entries.index(level.name())?.unwrap_or(0));
@@ -315,13 +403,21 @@ impl<'a> Decoder<'a> {
         for child in self.children(node, &["rename", "create", "remove", "stop"])? {
             let entries = self.read(child, &[])?;
             operation = Some(match child.name().value() {
-                "rename" => Operation::Rename { input: entries.optional_string_arg()?.unwrap_or_default() },
-                "create" => Operation::Create { input: entries.optional_string_arg()?.unwrap_or_default() },
+                "rename" => Operation::Rename {
+                    input: entries.optional_string_arg()?.unwrap_or_default(),
+                },
+                "create" => Operation::Create {
+                    input: entries.optional_string_arg()?.unwrap_or_default(),
+                },
                 "remove" => Operation::Remove,
                 _ => Operation::Stop,
             });
         }
-        Ok(Navigation { focus, cursor, operation })
+        Ok(Navigation {
+            focus,
+            cursor,
+            operation,
+        })
     }
 }
 
@@ -339,7 +435,8 @@ impl Entries<'_> {
     }
 
     fn string_arg(&self) -> Result<String, String> {
-        self.optional_string_arg()?.ok_or_else(|| self.error("an argument is missing"))
+        self.optional_string_arg()?
+            .ok_or_else(|| self.error("an argument is missing"))
     }
 
     fn index_arg(&self) -> Result<usize, String> {
@@ -350,34 +447,49 @@ impl Entries<'_> {
     }
 
     fn string(&self, key: &str) -> Result<Option<String>, String> {
-        self.node.get(key).map(|value| string(self.decoder, self.node, value)).transpose()
+        self.node
+            .get(key)
+            .map(|value| string(self.decoder, self.node, value))
+            .transpose()
     }
 
     fn number<T: TryFrom<i128>>(&self, key: &str) -> Result<Option<T>, String> {
         match self.node.get(key) {
             None => Ok(None),
-            Some(KdlValue::Integer(n)) => T::try_from(*n).map(Some).map_err(|_| self.error(&format!("{key} is out of range"))),
+            Some(KdlValue::Integer(n)) => T::try_from(*n)
+                .map(Some)
+                .map_err(|_| self.error(&format!("{key} is out of range"))),
             Some(_) => Err(self.error(&format!("{key} should be a number"))),
         }
     }
 
     fn index(&self, key: &str) -> Result<Option<usize>, String> {
-        self.node.get(key).map(|value| position(self.decoder, self.node, value)).transpose()
+        self.node
+            .get(key)
+            .map(|value| position(self.decoder, self.node, value))
+            .transpose()
     }
 
     fn layout(&self) -> Result<String, String> {
-        Ok(self.string("layout")?.unwrap_or_else(|| DEFAULT_LAYOUT.into()))
+        Ok(self
+            .string("layout")?
+            .unwrap_or_else(|| DEFAULT_LAYOUT.into()))
     }
 }
 
 fn string(decoder: &Decoder, node: &KdlNode, value: &KdlValue) -> Result<String, String> {
-    value.as_string().map(str::to_string).ok_or_else(|| decoder.error(node, &format!("{value} should be a string")))
+    value
+        .as_string()
+        .map(str::to_string)
+        .ok_or_else(|| decoder.error(node, &format!("{value} should be a string")))
 }
 
 /// An index as written, counting from 1.
 fn position(decoder: &Decoder, node: &KdlNode, value: &KdlValue) -> Result<usize, String> {
     match value {
-        KdlValue::Integer(n) if *n >= 1 => usize::try_from(*n - 1).map_err(|_| decoder.error(node, "index out of range")),
+        KdlValue::Integer(n) if *n >= 1 => {
+            usize::try_from(*n - 1).map_err(|_| decoder.error(node, "index out of range"))
+        }
         _ => Err(decoder.error(node, &format!("{value} is no index: they count from 1"))),
     }
 }
@@ -390,7 +502,6 @@ mod tests {
     #[test]
     fn round_trip() {
         let mut nui = sample();
-        nui.plugins.push("plugins/example.lua".into());
         nui.sessions[0].layout = "columns".into();
         nui.sessions[0].active = 1;
         let terminal = &mut nui.sessions[0].terminals[1];
@@ -401,13 +512,22 @@ mod tests {
         nui.sessions[0].windows[0].tabs[0].panes[0].name = Some("logs".into());
         nui.navigation = Some(Navigation {
             focus: Level::Tab,
-            cursor: Location { session: 0, window: 0, tab: 1, pane: 0 },
-            operation: Some(Operation::Rename { input: "draft".into() }),
+            cursor: Location {
+                session: 0,
+                window: 0,
+                tab: 1,
+                pane: 0,
+            },
+            operation: Some(Operation::Rename {
+                input: "draft".into(),
+            }),
         });
         nui.message = Some("hello".into());
         let text = encode(&nui);
         assert_eq!(decode(&text).unwrap(), nui, "{text}");
-        nui.navigation.as_mut().unwrap().operation = Some(Operation::Create { input: String::new() });
+        nui.navigation.as_mut().unwrap().operation = Some(Operation::Create {
+            input: String::new(),
+        });
         assert_eq!(decode(&encode(&nui)).unwrap(), nui);
     }
 
@@ -420,7 +540,6 @@ mod tests {
             }
         "#;
         let nui = decode(text).unwrap();
-        assert_eq!(nui.toggle, "ctrl-g");
         let tab = &nui.sessions[0].windows[0].tabs[0];
         assert_eq!((tab.layout.as_str(), tab.panes.len()), ("tabs", 2));
         assert_eq!(nui.sessions[0].windows[0].name.as_deref(), Some("dev"));
@@ -428,8 +547,12 @@ mod tests {
 
     #[test]
     fn errors_say_where() {
-        let error = decode("session main {\n  window {\n    tab layuot=columns\n  }\n}").unwrap_err();
-        assert!(error.starts_with("line 3, tab: unknown property layuot"), "{error}");
+        let error =
+            decode("session main {\n  window {\n    tab layuot=columns\n  }\n}").unwrap_err();
+        assert!(
+            error.starts_with("line 3, tab: unknown property layuot"),
+            "{error}"
+        );
         assert!(decode("session main {").unwrap_err().starts_with("line 1"));
         assert!(decode("attached 0").is_err());
     }
