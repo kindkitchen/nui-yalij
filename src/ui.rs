@@ -74,7 +74,15 @@ pub fn navigation(
         .split(sections);
     let buffer = frame.buffer_mut();
     for (level, column) in Level::ALL.into_iter().zip(columns.iter()) {
-        section(buffer, nui, navigation, level, *column, &decoration.theme);
+        section(
+            buffer,
+            nui,
+            runtime,
+            navigation,
+            level,
+            *column,
+            &decoration.theme,
+        );
     }
     for column in columns.iter().skip(1) {
         for y in column.top()..column.bottom() {
@@ -139,6 +147,7 @@ pub fn navigation(
 fn section(
     buffer: &mut Buffer,
     nui: &Nui,
+    runtime: &impl Screens,
     navigation: &Navigation,
     level: Level,
     area: Rect,
@@ -146,8 +155,8 @@ fn section(
 ) {
     let title = match level {
         Level::Session => " sessions",
+        Level::Workspace => " workspaces",
         Level::Window => " windows",
-        Level::Tab => " tabs",
         Level::Pane => " panes",
     };
     let title_style = if level == navigation.focus {
@@ -190,7 +199,7 @@ fn section(
         buffer.set_line(
             line.x,
             line.y,
-            &item(nui, level, at, index, theme),
+            &item(nui, runtime, level, at, index, theme),
             line.width,
         );
     }
@@ -201,9 +210,16 @@ fn scroll(hovered: usize, height: u16) -> usize {
     (hovered + 1).saturating_sub(height.max(1) as usize)
 }
 
-/// An item: a dot when its parent shows it, its label, and whether its
-/// terminals run.
-fn item(nui: &Nui, level: Level, at: Location, index: usize, theme: &Theme) -> Line<'static> {
+/// An item: a dot when its parent shows it, its label, whether its terminals
+/// run, and what their programs call attention to.
+fn item(
+    nui: &Nui,
+    runtime: &impl Screens,
+    level: Level,
+    at: Location,
+    index: usize,
+    theme: &Theme,
+) -> Line<'static> {
     let dot = if nui.is_active(level, at) {
         Span::raw("●").fg(theme.active)
     } else {
@@ -214,26 +230,63 @@ fn item(nui: &Nui, level: Level, at: Location, index: usize, theme: &Theme) -> L
         _ => format!("{} {}", index + 1, nui.label(level, at)),
     };
     let mut spans = vec![" ".into(), dot, " ".into(), label.into()];
-    match nui.shown(at).filter(|_| level == Level::Pane) {
+    let inside = match nui.shown(at).filter(|_| level == Level::Pane) {
         Some(terminal) if terminal.status != Status::Running => {
             let (text, color) = status(terminal, theme);
             spans.push(Span::styled(format!(" {text}"), color));
+            return Line::from(spans);
         }
-        Some(_) => {}
-        None => {
-            let session = &nui.sessions[at.session];
-            let inside = nui.terminals_in(level, at);
-            let running = |id: &u64| {
-                session
-                    .terminal(*id)
-                    .is_some_and(|terminal| terminal.status == Status::Running)
-            };
-            if !inside.is_empty() && !inside.iter().any(running) {
-                spans.push(Span::styled(" stopped", theme.notice));
-            }
-        }
+        Some(terminal) => vec![terminal.id],
+        None => nui.terminals_in(level, at),
+    };
+    let session = &nui.sessions[at.session];
+    let running: Vec<u64> = inside
+        .iter()
+        .copied()
+        .filter(|id| {
+            session
+                .terminal(*id)
+                .is_some_and(|terminal| terminal.status == Status::Running)
+        })
+        .collect();
+    if !inside.is_empty() && running.is_empty() {
+        spans.push(Span::styled(" stopped", theme.notice));
+    }
+    let (progress, bell) = attention(runtime, at.session, &running);
+    if let Some(progress) = progress {
+        spans.push(Span::styled(format!(" {progress}"), theme.accent));
+    }
+    if bell {
+        spans.push(Span::styled(" bell", theme.notice));
     }
     Line::from(spans)
+}
+
+/// What the programs of terminals call attention to: their progress in a
+/// word, and whether a bell rang that nobody saw.
+fn attention(runtime: &impl Screens, session: usize, terminals: &[u64]) -> (Option<String>, bool) {
+    let mut progress: Option<String> = None;
+    let mut bell = false;
+    for id in terminals {
+        let Some(screen) = runtime.screen_at(session, *id) else {
+            continue;
+        };
+        let parser = lock(screen);
+        let replies = parser.callbacks();
+        bell |= replies.bell;
+        let word = match replies.progress() {
+            None => continue,
+            Some((1, percent)) if terminals.len() == 1 => format!("{percent}%"),
+            Some((2, _)) => "error".into(),
+            Some((4, _)) if terminals.len() == 1 => "paused".into(),
+            Some(_) => "working".into(),
+        };
+        // among many, an error tells the most
+        if progress.as_deref() != Some("error") {
+            progress = Some(word);
+        }
+    }
+    (progress, bell)
 }
 
 /// The bottom half: the hovered item as the view would show it, under a rule

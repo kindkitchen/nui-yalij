@@ -141,6 +141,8 @@ impl Drop for Home {
 
 struct Tui {
     screen: Arc<Mutex<vt100::Parser>>,
+    /// All the client wrote, for what is no drawing: answers to pass on.
+    raw: Arc<Mutex<Vec<u8>>>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     master: Box<dyn MasterPty + Send>,
@@ -175,15 +177,18 @@ impl Tui {
         let mut reader = pair.master.try_clone_reader().unwrap();
         let size = |n| NonZeroU16::new(n).unwrap();
         let screen = Arc::new(Mutex::new(vt100::Parser::new(size(ROWS), size(COLS), 0)));
-        let output = screen.clone();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let (output, written) = (screen.clone(), raw.clone());
         thread::spawn(move || {
             let mut buffer = [0; 8192];
             while let Ok(count @ 1..) = reader.read(&mut buffer) {
+                written.lock().unwrap().extend_from_slice(&buffer[..count]);
                 output.lock().unwrap().process(&buffer[..count]);
             }
         });
         Tui {
             screen,
+            raw,
             writer: pair.master.take_writer().unwrap(),
             child,
             master: pair.master,
@@ -197,6 +202,9 @@ impl Tui {
     fn text(&self) -> String {
         self.screen.lock().unwrap().screen().contents()
     }
+    fn raw(&self) -> String {
+        String::from_utf8_lossy(&self.raw.lock().unwrap()).into_owned()
+    }
     fn rows(&self) -> Vec<String> {
         self.screen.lock().unwrap().screen().rows(0, COLS).collect()
     }
@@ -205,8 +213,16 @@ impl Tui {
         while !condition(self) {
             assert!(
                 Instant::now() < deadline,
-                "timed out: {about}; screen:\n{}",
-                self.text()
+                "timed out: {about}; screen:\n{}\nlast written: {:?}",
+                self.text(),
+                self.raw()
+                    .chars()
+                    .rev()
+                    .take(600)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<String>()
             );
             thread::sleep(Duration::from_millis(40));
         }
@@ -263,6 +279,7 @@ impl Drop for Tui {
 #[test]
 fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
     let home = Home::new("core");
+    // the old application's shape: workspaces were windows of tabs
     home.write(&home.global(), "toggle ctrl-g\nsession main { terminal 1 command=\"/bin/sh\"; window { tab { pane terminal=1 } } }");
     let mut tui = Tui::start(&home, &[]);
     tui.prompt();
@@ -325,7 +342,10 @@ fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
     );
     assert_eq!(home.pid(1, 1), Some(pid));
     again.detach("\x07");
-    assert!(home.ok(&["list"]).contains("dev  id: 1  windows: 1"));
+    assert!(
+        home.ok(&["list"])
+            .contains("dev  id: 1  workspaces: 1  windows: 1  panes: 1")
+    );
     home.stop();
 }
 
@@ -524,7 +544,7 @@ fn plugins_and_inside_attach_route_to_the_typing_instance() {
         &home.config().join("decoration.kdl"),
         &format!("plugin \"{}\"", example.display()),
     );
-    home.write(&home.global(), "session main { terminal 1 command=\"/bin/sh\"; terminal 2 command=\"/bin/sh\"; window { tab layout=columns { pane terminal=1; pane terminal=2 } } }");
+    home.write(&home.global(), "session main { terminal 1 command=\"/bin/sh\"; terminal 2 command=\"/bin/sh\"; workspace { window layout=columns { pane terminal=1; pane terminal=2 } } }");
     let mut tui = Tui::start(&home, &[]);
     tui.wait("two columns", |tui| {
         tui.rows()[0].starts_with('$') && tui.rows()[0].contains("│$")
@@ -555,6 +575,111 @@ fn plugins_and_inside_attach_route_to_the_typing_instance() {
     );
     watcher.detach("\x07");
     tui.detach("\x07");
+}
+
+#[test]
+fn programs_talk_to_the_terminal_around_through_the_client() {
+    let home = Home::new("terminal");
+    let mut tui = Tui::start(&home, &[]);
+    tui.prompt();
+    // the client asks the terminal around it; answer as Ghostty would
+    tui.wait("questions", |tui| {
+        tui.raw().contains("\x1b]11;?\x07\x1b]4;0;?")
+    });
+    assert!(tui.raw().contains("\x1b[>5u"));
+    tui.send("\x1b[?5u\x1b]11;rgb:1111/2222/3333\x1b\\\x1b[?62;22c");
+
+    // shift with enter, in kitty's escape codes, reaches a program asking for them...
+    tui.send("printf '\\033[>1u'; stty raw -echo; printf ready-$((40+1)); k=$(dd bs=1 count=7 2>/dev/null); stty sane; printf '\\033[<u'; printf 'got-1:%s\\n' \"$k\" | tr '\\033' E\r");
+    tui.text_is("ready-41");
+    tui.send("\x1b[13;2u");
+    tui.text_is("got-1:E[13;2u");
+    // ...and as enter to one that doesn't
+    tui.send("stty raw -echo; printf ready-$((40+2)); k=$(dd bs=1 count=1 2>/dev/null); stty sane; printf 'got-2:%s\\n' \"$k\" | tr '\\r' R\r");
+    tui.text_is("ready-42");
+    tui.send("\x1b[13;2u");
+    tui.text_is("got-2:R");
+
+    // focus, to a program asking for it
+    tui.send("printf '\\033[?1004h'; stty raw -echo; printf ready-$((40+3)); k=$(dd bs=1 count=3 2>/dev/null); stty sane; printf '\\033[?1004l'; printf 'got-3:%s\\n' \"$k\" | tr '\\033' E\r");
+    tui.text_is("ready-43");
+    tui.send("\x1b[O");
+    tui.text_is("got-3:E[O");
+    tui.send("\x1b[I");
+
+    // the colors of the terminal around answer the programs inside
+    tui.send("stty raw -echo; printf '\\033]11;?\\007'; k=$(dd bs=1 count=24 2>/dev/null); stty sane; printf 'got-4:%s\\n' \"$k\" | tr '\\033\\007' EB\r");
+    tui.text_is("got-4:E]11;rgb:1111/2222/3333B");
+
+    // copies to the clipboard, titles and progress pass on to it
+    tui.send("printf '\\033]52;c;aGVsbG8=\\007\\033]2;title-%s\\007\\033]9;4;3\\007' $((40+5))\r");
+    tui.wait("passed on", |tui| {
+        let raw = tui.raw();
+        raw.contains("\x1b]52;c;aGVsbG8=\x07")
+            && raw.contains("\x1b]2;title-45\x07")
+            && raw.contains("\x1b]9;4;3;0\x07")
+    });
+    // ctrl with the key of g on a Ukrainian layout is ctrl-g; progress shows
+    tui.send("\x1b[1087::103;5u");
+    tui.text_is("panes");
+    tui.text_is("working");
+    tui.send("\x1b[27u");
+    tui.view();
+
+    // a terminal around without kitty's escape codes gets xterm's modifyOtherKeys
+    let mut plain = Tui::start(&home, &["attach", "main"]);
+    plain.prompt();
+    plain.wait("questions", |tui| tui.raw().contains("\x1b[c"));
+    plain.send("\x1b[?62;22c");
+    plain.wait("modifyOtherKeys", |tui| tui.raw().contains("\x1b[>4;2m"));
+    plain.detach("\x07");
+    plain.wait("taken back", |tui| tui.raw().contains("\x1b[>4;0m"));
+    tui.detach("\x07");
+    tui.wait("taken back", |tui| tui.raw().contains("\x1b[<u"));
+}
+
+#[test]
+fn a_command_inside_a_pane_toggles_navigation_of_the_instance_typing() {
+    let home = Home::new("command");
+    home.write(
+        &home.config().join("profiles/work.kdl"),
+        "commands { panel navi }",
+    );
+    let mut tui = Tui::start(&home, &[]);
+    tui.prompt();
+    // first on the PATH of the terminals of the session, and nowhere else
+    tui.send("command -v t\r");
+    tui.text_is("global.kdl.sessions/1/bin/t");
+    // the path reads as the panel
+    tui.send("clear\r");
+    tui.view();
+    tui.send("t\r");
+    tui.text_is("panes");
+    tui.send("\x1b");
+    tui.view();
+    // another profile's command is there too, but not this instance's
+    tui.send("navi\r");
+    tui.text_is("navi is not a command of this instance");
+
+    // decoration renames it, or unbinds it; reload rewrites them
+    home.write(
+        &home.config().join("decoration.kdl"),
+        "commands { panel nav }",
+    );
+    home.ok(&["reload"]);
+    tui.send("clear; t; nav\r");
+    tui.text_is("not found");
+    tui.text_is("panes");
+    tui.send("\x1b");
+    tui.view();
+    // a session's decoration wins, live
+    home.write(&home.decoration(1), "commands { panel s }");
+    thread::sleep(Duration::from_millis(450));
+    tui.send("clear; nav; s\r");
+    tui.text_is("not found");
+    tui.text_is("panes");
+    tui.send("q");
+    tui.exited();
 }
 
 #[test]
@@ -675,7 +800,7 @@ fn kill_reaps_a_process_that_ignores_hangup() {
         &home.global(),
         r#"session main {
         terminal 1 command="/bin/sh" { args "-c" "trap '' HUP; printf READY; exec sleep 30" }
-        window { tab { pane terminal=1 } }
+        workspace { window { pane terminal=1 } }
     }"#,
     );
     let mut tui = Tui::start(&home, &[]);

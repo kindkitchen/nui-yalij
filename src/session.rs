@@ -1,7 +1,9 @@
 //! One serialized owner per session: its KDL state, PTYs and automatic hooks.
 //! Owners share a coordinator process/transport, not state or PTY runtimes.
 
-use std::{path::Path, sync::mpsc::Sender};
+use std::{
+    collections::BTreeSet, fs, os::unix::fs::PermissionsExt, path::Path, sync::mpsc::Sender,
+};
 
 use crate::{
     app::Event,
@@ -10,7 +12,7 @@ use crate::{
     plugin::Plugins,
     runtime::Runtime,
     state::{Fact, Nui, Session, Status},
-    store::Store,
+    store::{Store, mkdir},
 };
 
 pub struct SessionServer {
@@ -60,6 +62,7 @@ impl SessionServer {
         let mut runtime = Runtime::new(events, (24, 80));
         runtime.owner = id;
         runtime.global = Some(global.to_path_buf());
+        runtime.bin = Some(store.dir().join("bin"));
         let mut server = Self {
             state: state.clone(),
             runtime,
@@ -70,8 +73,18 @@ impl SessionServer {
             decoration,
             hooks: Plugins::new(shell.into()),
         };
+        server.write_commands(library);
         server.commit(state, library)?;
         Ok(server)
+    }
+
+    /// Write the commands of decoration where the terminals of the session
+    /// find them first, on their PATH: each a script calling this program.
+    pub fn write_commands(&mut self, library: &Library) {
+        let dir = self.store.dir().join("bin");
+        if let Err(error) = commands(&dir, &library.commands(&self.layer)) {
+            self.notice = Some(format!("commands: {error}"));
+        }
     }
 
     /// Called only by the coordinator's event loop. No client writes state files.
@@ -207,6 +220,38 @@ impl SessionServer {
             let _ = self.store.save(&kdl::encode_session(&self.state));
         }
     }
+}
+
+/// The scripts of the commands `names` in `dir`, and nothing else.
+fn commands(dir: &Path, names: &BTreeSet<String>) -> Result<(), String> {
+    let program = std::env::current_exe().map_err(|error| error.to_string())?;
+    let program = program
+        .to_str()
+        .ok_or("non-UTF8 program path")?
+        .replace('\'', r"'\''");
+    mkdir(dir)?;
+    let failed = |path: &Path, error: std::io::Error| format!("{}: {error}", path.display());
+    for entry in fs::read_dir(dir).map_err(|error| failed(dir, error))? {
+        let path = entry.map_err(|error| failed(dir, error))?.path();
+        let known = path.file_name().and_then(|name| name.to_str());
+        if !known.is_some_and(|name| names.contains(name)) {
+            fs::remove_file(&path).map_err(|error| failed(&path, error))?;
+        }
+    }
+    for name in names {
+        let path = dir.join(name);
+        // the names are plain: no quote to escape
+        let script = format!(
+            "#!/bin/sh\n# nui-yalij: a command of decoration, inside the terminals of a session\nexec '{program}' call '{name}'\n"
+        );
+        if fs::read_to_string(&path).is_ok_and(|known| known == script) {
+            continue;
+        }
+        fs::write(&path, script)
+            .and_then(|()| fs::set_permissions(&path, fs::Permissions::from_mode(0o700)))
+            .map_err(|error| failed(&path, error))?;
+    }
+    Ok(())
 }
 
 impl Drop for SessionServer {

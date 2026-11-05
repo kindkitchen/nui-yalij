@@ -29,40 +29,40 @@ pub struct Nui {
     pub message: Option<String>,
 }
 
-/// The entry point to any activity: it owns terminals and shows them in windows.
+/// The entry point to any activity: it owns terminals and shows them in workspaces.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Session {
     /// Stable identity in the global catalog, independent of its name or position.
     pub id: u64,
     pub name: String,
+    /// The layout strategy placing the workspaces.
+    pub layout: String,
+    /// The active workspace.
+    #[serde(with = "one_based")]
+    pub active: usize,
+    /// The processes of the session, shown by panes or detached.
+    pub terminals: Vec<Terminal>,
+    pub workspaces: Vec<Workspace>,
+}
+
+/// A grouping of windows: a marker of one visualization.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Workspace {
+    pub name: Option<String>,
     /// The layout strategy placing the windows.
     pub layout: String,
     /// The active window.
     #[serde(with = "one_based")]
     pub active: usize,
-    /// The processes of the session, shown by panes or detached.
-    pub terminals: Vec<Terminal>,
     pub windows: Vec<Window>,
-}
-
-/// A grouping of tabs: a marker of one visualization.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Window {
-    pub name: Option<String>,
-    /// The layout strategy placing the tabs.
-    pub layout: String,
-    /// The active tab.
-    #[serde(with = "one_based")]
-    pub active: usize,
-    pub tabs: Vec<Tab>,
 }
 
 /// A grouping of panes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Tab {
+pub struct Window {
     pub name: Option<String>,
     /// The layout strategy placing the panes.
     pub layout: String,
@@ -145,8 +145,8 @@ pub enum Operation {
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     Session,
+    Workspace,
     Window,
-    Tab,
     Pane,
 }
 
@@ -157,9 +157,9 @@ pub struct Location {
     #[serde(with = "one_based")]
     pub session: usize,
     #[serde(with = "one_based")]
-    pub window: usize,
+    pub workspace: usize,
     #[serde(with = "one_based")]
-    pub tab: usize,
+    pub window: usize,
     #[serde(with = "one_based")]
     pub pane: usize,
 }
@@ -193,23 +193,23 @@ impl Default for Session {
             layout: DEFAULT_LAYOUT.into(),
             active: 0,
             terminals: Vec::new(),
+            workspaces: Vec::new(),
+        }
+    }
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            name: None,
+            layout: DEFAULT_LAYOUT.into(),
+            active: 0,
             windows: Vec::new(),
         }
     }
 }
 
 impl Default for Window {
-    fn default() -> Self {
-        Self {
-            name: None,
-            layout: DEFAULT_LAYOUT.into(),
-            active: 0,
-            tabs: Vec::new(),
-        }
-    }
-}
-
-impl Default for Tab {
     fn default() -> Self {
         Self {
             name: None,
@@ -231,13 +231,13 @@ impl Operation {
 }
 
 impl Level {
-    pub const ALL: [Level; 4] = [Level::Session, Level::Window, Level::Tab, Level::Pane];
+    pub const ALL: [Level; 4] = [Level::Session, Level::Workspace, Level::Window, Level::Pane];
 
     pub fn name(self) -> &'static str {
         match self {
             Level::Session => "session",
+            Level::Workspace => "workspace",
             Level::Window => "window",
-            Level::Tab => "tab",
             Level::Pane => "pane",
         }
     }
@@ -257,8 +257,8 @@ impl Location {
     pub fn get(&self, level: Level) -> usize {
         match level {
             Level::Session => self.session,
+            Level::Workspace => self.workspace,
             Level::Window => self.window,
-            Level::Tab => self.tab,
             Level::Pane => self.pane,
         }
     }
@@ -266,8 +266,8 @@ impl Location {
     pub fn set(&mut self, level: Level, index: usize) {
         match level {
             Level::Session => self.session = index,
+            Level::Workspace => self.workspace = index,
             Level::Window => self.window = index,
-            Level::Tab => self.tab = index,
             Level::Pane => self.pane = index,
         }
     }
@@ -310,12 +310,24 @@ impl Session {
         self.terminals.iter().find(|terminal| terminal.id == id)
     }
 
+    /// The windows of all workspaces.
+    pub fn windows(&self) -> impl Iterator<Item = &Window> {
+        self.workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.windows)
+    }
+
+    /// The terminal the active pane shows, through the active workspace and window.
+    pub fn active_terminal(&self) -> Option<u64> {
+        let workspace = self.workspaces.get(self.active)?;
+        let window = workspace.windows.get(workspace.active)?;
+        Some(window.panes.get(window.active)?.terminal)
+    }
+
     /// The terminals some pane shows.
     fn shown(&self) -> HashSet<u64> {
-        self.windows
-            .iter()
-            .flat_map(|window| &window.tabs)
-            .flat_map(|tab| &tab.panes)
+        self.windows()
+            .flat_map(|window| &window.panes)
             .map(|pane| pane.terminal)
             .collect()
     }
@@ -327,32 +339,32 @@ impl Session {
         if level == Level::Session {
             return false;
         }
-        let Some(window) = self.windows.get_mut(at.window) else {
+        let Some(workspace) = self.workspaces.get_mut(at.workspace) else {
             return true;
         };
-        if level > Level::Window {
-            let Some(tab) = window.tabs.get_mut(at.tab) else {
+        if level > Level::Workspace {
+            let Some(window) = workspace.windows.get_mut(at.window) else {
                 return true;
             };
             if level == Level::Pane {
-                if at.pane >= tab.panes.len() {
+                if at.pane >= window.panes.len() {
                     return true;
                 }
-                tab.panes.remove(at.pane);
-                shift(&mut tab.active, at.pane, tab.panes.len());
-                if !tab.panes.is_empty() {
+                window.panes.remove(at.pane);
+                shift(&mut window.active, at.pane, window.panes.len());
+                if !window.panes.is_empty() {
                     return true;
                 }
             }
-            window.tabs.remove(at.tab);
-            shift(&mut window.active, at.tab, window.tabs.len());
-            if !window.tabs.is_empty() {
+            workspace.windows.remove(at.window);
+            shift(&mut workspace.active, at.window, workspace.windows.len());
+            if !workspace.windows.is_empty() {
                 return true;
             }
         }
-        self.windows.remove(at.window);
-        shift(&mut self.active, at.window, self.windows.len());
-        !self.windows.is_empty()
+        self.workspaces.remove(at.workspace);
+        shift(&mut self.active, at.workspace, self.workspaces.len());
+        !self.workspaces.is_empty()
     }
 }
 
@@ -362,7 +374,7 @@ impl Nui {
         self.active_location(self.attached)
     }
 
-    /// The active pane of a session, through its active window and tab.
+    /// The active pane of a session, through its active workspace and window.
     pub fn active_location(&self, session: usize) -> Option<Location> {
         let at = self.descend(
             Level::Session,
@@ -376,31 +388,31 @@ impl Nui {
 
     /// `at` with the levels below `level` moved to the active children.
     pub fn descend(&self, level: Level, mut at: Location) -> Location {
-        if level < Level::Window {
-            at.window = self
+        if level < Level::Workspace {
+            at.workspace = self
                 .sessions
                 .get(at.session)
                 .map_or(0, |session| session.active);
         }
-        if level < Level::Tab {
-            at.tab = self.window(at).map_or(0, |window| window.active);
+        if level < Level::Window {
+            at.window = self.workspace(at).map_or(0, |workspace| workspace.active);
         }
         if level < Level::Pane {
-            at.pane = self.tab(at).map_or(0, |tab| tab.active);
+            at.pane = self.window(at).map_or(0, |window| window.active);
         }
         at
     }
 
-    pub fn window(&self, at: Location) -> Option<&Window> {
-        self.sessions.get(at.session)?.windows.get(at.window)
+    pub fn workspace(&self, at: Location) -> Option<&Workspace> {
+        self.sessions.get(at.session)?.workspaces.get(at.workspace)
     }
 
-    pub fn tab(&self, at: Location) -> Option<&Tab> {
-        self.window(at)?.tabs.get(at.tab)
+    pub fn window(&self, at: Location) -> Option<&Window> {
+        self.workspace(at)?.windows.get(at.window)
     }
 
     pub fn pane(&self, at: Location) -> Option<&Pane> {
-        self.tab(at)?.panes.get(at.pane)
+        self.window(at)?.panes.get(at.pane)
     }
 
     /// The terminal the pane at `at` shows.
@@ -442,12 +454,14 @@ impl Nui {
     pub fn count(&self, level: Level, at: Location) -> usize {
         match level {
             Level::Session => self.sessions.len(),
-            Level::Window => self
+            Level::Workspace => self
                 .sessions
                 .get(at.session)
-                .map_or(0, |session| session.windows.len()),
-            Level::Tab => self.window(at).map_or(0, |window| window.tabs.len()),
-            Level::Pane => self.tab(at).map_or(0, |tab| tab.panes.len()),
+                .map_or(0, |session| session.workspaces.len()),
+            Level::Window => self
+                .workspace(at)
+                .map_or(0, |workspace| workspace.windows.len()),
+            Level::Pane => self.window(at).map_or(0, |window| window.panes.len()),
         }
     }
 
@@ -456,14 +470,16 @@ impl Nui {
     pub fn is_active(&self, level: Level, at: Location) -> bool {
         match level {
             Level::Session => at.session == self.attached,
-            Level::Window => self
+            Level::Workspace => self
                 .sessions
                 .get(at.session)
-                .is_some_and(|session| session.active == at.window),
-            Level::Tab => self
+                .is_some_and(|session| session.active == at.workspace),
+            Level::Window => self
+                .workspace(at)
+                .is_some_and(|workspace| workspace.active == at.window),
+            Level::Pane => self
                 .window(at)
-                .is_some_and(|window| window.active == at.tab),
-            Level::Pane => self.tab(at).is_some_and(|tab| tab.active == at.pane),
+                .is_some_and(|window| window.active == at.pane),
         }
     }
 
@@ -475,16 +491,16 @@ impl Nui {
                 .sessions
                 .get(at.session)
                 .map(|session| session.name.clone()),
+            Level::Workspace => self.workspace(at).map(|workspace| {
+                workspace.name.clone().unwrap_or_else(|| {
+                    self.label(Level::Window, at.with(Level::Window, workspace.active))
+                })
+            }),
             Level::Window => self.window(at).map(|window| {
                 window
                     .name
                     .clone()
-                    .unwrap_or_else(|| self.label(Level::Tab, at.with(Level::Tab, window.active)))
-            }),
-            Level::Tab => self.tab(at).map(|tab| {
-                tab.name
-                    .clone()
-                    .unwrap_or_else(|| self.label(Level::Pane, at.with(Level::Pane, tab.active)))
+                    .unwrap_or_else(|| self.label(Level::Pane, at.with(Level::Pane, window.active)))
             }),
             Level::Pane => self.pane(at).map(|pane| {
                 pane.name.clone().unwrap_or_else(|| {
@@ -510,16 +526,16 @@ impl Nui {
                     .map(|terminal| terminal.id)
                     .collect();
             }
+            Level::Workspace => self
+                .workspace(at)
+                .into_iter()
+                .flat_map(|workspace| &workspace.windows)
+                .flat_map(|window| &window.panes)
+                .collect(),
             Level::Window => self
                 .window(at)
                 .into_iter()
-                .flat_map(|window| &window.tabs)
-                .flat_map(|tab| &tab.panes)
-                .collect(),
-            Level::Tab => self
-                .tab(at)
-                .into_iter()
-                .flat_map(|tab| &tab.panes)
+                .flat_map(|window| &window.panes)
                 .collect(),
             Level::Pane => self.pane(at).into_iter().collect(),
         };
@@ -529,25 +545,26 @@ impl Nui {
         ids
     }
 
-    /// Add a session of one window, tab and pane showing a new terminal; returns its index.
+    /// Add a session of one workspace, window and pane showing a new terminal;
+    /// returns its index.
     pub fn add_session(&mut self, name: &str, command: &str, cwd: Option<String>) -> usize {
         let id = self.next_terminal_id();
-        let tab = Tab {
+        let window = Window {
             panes: vec![Pane {
                 name: None,
                 terminal: id,
             }],
-            ..Tab::default()
-        };
-        let window = Window {
-            tabs: vec![tab],
             ..Window::default()
+        };
+        let workspace = Workspace {
+            windows: vec![window],
+            ..Workspace::default()
         };
         self.sessions.push(Session {
             id: self.next_session_id(),
             name: name.into(),
             terminals: vec![Terminal::new(id, command, cwd)],
-            windows: vec![window],
+            workspaces: vec![workspace],
             ..Session::default()
         });
         self.sessions.len() - 1
@@ -569,15 +586,15 @@ impl Nui {
             name: first(Level::Pane),
             terminal: id,
         };
-        let tab = Tab {
-            name: first(Level::Tab),
-            panes: vec![pane.clone()],
-            ..Tab::default()
-        };
         let window = Window {
             name: first(Level::Window),
-            tabs: vec![tab.clone()],
+            panes: vec![pane.clone()],
             ..Window::default()
+        };
+        let workspace = Workspace {
+            name: first(Level::Workspace),
+            windows: vec![window.clone()],
+            ..Workspace::default()
         };
         let terminal = Terminal::new(id, command, cwd);
         if level == Level::Session {
@@ -591,7 +608,7 @@ impl Nui {
                 id: self.next_session_id(),
                 name,
                 terminals: vec![terminal],
-                windows: vec![window],
+                workspaces: vec![workspace],
                 ..Session::default()
             };
             let index = insert(
@@ -607,8 +624,31 @@ impl Nui {
         }
         let session = self.sessions.get_mut(at.session)?;
         let new = match level {
-            Level::Window => {
+            Level::Workspace => {
                 let names: Vec<_> = session
+                    .workspaces
+                    .iter()
+                    .map(|workspace| workspace.name.as_deref())
+                    .collect();
+                let workspace = Workspace {
+                    name: Some(automatic(level, &names)),
+                    ..workspace
+                };
+                let index = insert(
+                    &mut session.workspaces,
+                    &mut session.active,
+                    at.workspace + 1,
+                    workspace,
+                );
+                Location {
+                    session: at.session,
+                    workspace: index,
+                    ..Location::default()
+                }
+            }
+            Level::Window => {
+                let parent = session.workspaces.get_mut(at.workspace)?;
+                let names: Vec<_> = parent
                     .windows
                     .iter()
                     .map(|window| window.name.as_deref())
@@ -617,33 +657,23 @@ impl Nui {
                     name: Some(automatic(level, &names)),
                     ..window
                 };
-                let index = insert(
-                    &mut session.windows,
-                    &mut session.active,
-                    at.window + 1,
-                    window,
-                );
                 Location {
-                    session: at.session,
-                    window: index,
-                    ..Location::default()
-                }
-            }
-            Level::Tab => {
-                let parent = session.windows.get_mut(at.window)?;
-                let names: Vec<_> = parent.tabs.iter().map(|tab| tab.name.as_deref()).collect();
-                let tab = Tab {
-                    name: Some(automatic(level, &names)),
-                    ..tab
-                };
-                Location {
-                    tab: insert(&mut parent.tabs, &mut parent.active, at.tab + 1, tab),
+                    window: insert(
+                        &mut parent.windows,
+                        &mut parent.active,
+                        at.window + 1,
+                        window,
+                    ),
                     pane: 0,
                     ..at
                 }
             }
             _ => {
-                let parent = session.windows.get_mut(at.window)?.tabs.get_mut(at.tab)?;
+                let parent = session
+                    .workspaces
+                    .get_mut(at.workspace)?
+                    .windows
+                    .get_mut(at.window)?;
                 let names: Vec<_> = parent
                     .panes
                     .iter()
@@ -663,8 +693,8 @@ impl Nui {
         Some(new)
     }
 
-    /// Rename the node at `level` of `at`. An empty name gives a window, tab or
-    /// pane back the name of what it shows; a session needs a unique one.
+    /// Rename the node at `level` of `at`. An empty name gives a workspace,
+    /// window or pane back the name of what it shows; a session needs a unique one.
     pub fn rename(&mut self, level: Level, at: Location, name: &str) -> Result<(), String> {
         let name = name.trim();
         let missing = || format!("no such {}", level.name());
@@ -685,17 +715,20 @@ impl Nui {
         }
         let name = (!name.is_empty()).then(|| name.to_string());
         let session = self.sessions.get_mut(at.session).ok_or_else(missing)?;
-        let window = session.windows.get_mut(at.window).ok_or_else(missing)?;
+        let workspace = session
+            .workspaces
+            .get_mut(at.workspace)
+            .ok_or_else(missing)?;
+        if level == Level::Workspace {
+            workspace.name = name;
+            return Ok(());
+        }
+        let window = workspace.windows.get_mut(at.window).ok_or_else(missing)?;
         if level == Level::Window {
             window.name = name;
             return Ok(());
         }
-        let tab = window.tabs.get_mut(at.tab).ok_or_else(missing)?;
-        if level == Level::Tab {
-            tab.name = name;
-            return Ok(());
-        }
-        tab.panes.get_mut(at.pane).ok_or_else(missing)?.name = name;
+        window.panes.get_mut(at.pane).ok_or_else(missing)?.name = name;
         Ok(())
     }
 
@@ -738,10 +771,10 @@ impl Nui {
         };
         self.attached = at.session;
         let session = &mut self.sessions[at.session];
-        session.active = at.window;
-        let window = &mut session.windows[at.window];
-        window.active = at.tab;
-        window.tabs[at.tab].active = at.pane;
+        session.active = at.workspace;
+        let workspace = &mut session.workspaces[at.workspace];
+        workspace.active = at.window;
+        workspace.windows[at.window].active = at.pane;
         if let Some(terminal) = session
             .terminals
             .iter_mut()
@@ -814,25 +847,25 @@ impl Nui {
                 .iter()
                 .map(|terminal| terminal.id)
                 .collect();
-            if session.windows.is_empty() {
-                return Err(format!("session {name} has no windows"));
+            if session.workspaces.is_empty() {
+                return Err(format!("session {name} has no workspaces"));
             }
-            clamp(&mut session.active, session.windows.len());
-            for (w, window) in session.windows.iter_mut().enumerate() {
-                if window.tabs.is_empty() {
-                    return Err(format!("session {name}, window {}: no tabs", w + 1));
+            clamp(&mut session.active, session.workspaces.len());
+            for (w, workspace) in session.workspaces.iter_mut().enumerate() {
+                if workspace.windows.is_empty() {
+                    return Err(format!("session {name}, workspace {}: no windows", w + 1));
                 }
-                clamp(&mut window.active, window.tabs.len());
-                for (t, tab) in window.tabs.iter_mut().enumerate() {
-                    if tab.panes.is_empty() {
+                clamp(&mut workspace.active, workspace.windows.len());
+                for (v, window) in workspace.windows.iter_mut().enumerate() {
+                    if window.panes.is_empty() {
                         return Err(format!(
-                            "session {name}, window {}, tab {}: no panes",
+                            "session {name}, workspace {}, window {}: no panes",
                             w + 1,
-                            t + 1
+                            v + 1
                         ));
                     }
-                    clamp(&mut tab.active, tab.panes.len());
-                    if let Some(pane) = tab
+                    clamp(&mut window.active, window.panes.len());
+                    if let Some(pane) = window
                         .panes
                         .iter()
                         .find(|pane| !known.contains(&pane.terminal))
@@ -877,7 +910,7 @@ fn clamp(index: &mut usize, len: usize) {
 }
 
 /// The automatic name of a node at `level` joining siblings of these names:
-/// `window-3` as the third window, or the next one no sibling has.
+/// `workspace-3` as the third workspace, or the next one no sibling has.
 fn automatic(level: Level, siblings: &[Option<&str>]) -> String {
     (siblings.len() + 1..)
         .map(|n| format!("{}-{n}", level.name()))
@@ -929,8 +962,9 @@ mod one_based {
 pub(crate) mod tests {
     use super::*;
 
-    /// A session `main` of two windows: the first with tabs of 2 and 1 panes,
-    /// the second with one pane; the second pane shows the first terminal again.
+    /// A session `main` of two workspaces: the first with windows of 2 and 1
+    /// panes, the second with one pane; the second pane shows the first
+    /// terminal again.
     pub(crate) fn sample() -> Nui {
         let mut nui = Nui::default();
         nui.add_session("main", "sh", None);
@@ -942,26 +976,26 @@ pub(crate) mod tests {
             name: None,
             terminal,
         };
-        session.windows[0].tabs[0].panes.push(pane(1));
-        session.windows[0].tabs.push(Tab {
+        session.workspaces[0].windows[0].panes.push(pane(1));
+        session.workspaces[0].windows.push(Window {
             panes: vec![pane(2)],
-            ..Tab::default()
-        });
-        session.windows.push(Window {
-            tabs: vec![Tab {
-                panes: vec![pane(3)],
-                ..Tab::default()
-            }],
             ..Window::default()
+        });
+        session.workspaces.push(Workspace {
+            windows: vec![Window {
+                panes: vec![pane(3)],
+                ..Window::default()
+            }],
+            ..Workspace::default()
         });
         nui
     }
 
-    fn at(session: usize, window: usize, tab: usize, pane: usize) -> Location {
+    fn at(session: usize, workspace: usize, window: usize, pane: usize) -> Location {
         Location {
             session,
+            workspace,
             window,
-            tab,
             pane,
         }
     }
@@ -969,11 +1003,11 @@ pub(crate) mod tests {
     #[test]
     fn labels_derive_from_what_is_shown() {
         let mut nui = sample();
-        assert_eq!(nui.label(Level::Window, at(0, 1, 0, 0)), "vim");
+        assert_eq!(nui.label(Level::Workspace, at(0, 1, 0, 0)), "vim");
         nui.rename(Level::Pane, at(0, 1, 0, 0), "editor").unwrap();
-        assert_eq!(nui.label(Level::Window, at(0, 1, 0, 0)), "editor");
+        assert_eq!(nui.label(Level::Workspace, at(0, 1, 0, 0)), "editor");
         nui.rename(Level::Pane, at(0, 1, 0, 0), "  ").unwrap();
-        assert_eq!(nui.label(Level::Tab, at(0, 1, 0, 0)), "vim");
+        assert_eq!(nui.label(Level::Window, at(0, 1, 0, 0)), "vim");
     }
 
     #[test]
@@ -990,11 +1024,11 @@ pub(crate) mod tests {
     fn removal_keeps_terminals_still_shown() {
         let mut nui = sample();
         nui.remove(Level::Pane, at(0, 0, 0, 0));
-        // terminal 1 is still shown by the other pane of the tab
+        // terminal 1 is still shown by the other pane of the window
         assert_eq!(nui.sessions[0].terminals.len(), 3);
         nui.remove(Level::Pane, at(0, 0, 0, 0));
-        // the tab went with its last pane, and terminal 1 with it
-        assert_eq!(nui.sessions[0].windows[0].tabs.len(), 1);
+        // the window went with its last pane, and terminal 1 with it
+        assert_eq!(nui.sessions[0].workspaces[0].windows.len(), 1);
         assert!(nui.sessions[0].terminal(1).is_none());
     }
 
@@ -1003,9 +1037,9 @@ pub(crate) mod tests {
         let mut nui = sample();
         nui.add_session("other", "sh", None);
         nui.attached = 1;
-        nui.remove(Level::Window, at(0, 1, 0, 0));
-        nui.remove(Level::Tab, at(0, 0, 1, 0));
-        assert_eq!(nui.sessions[0].windows.len(), 1);
+        nui.remove(Level::Workspace, at(0, 1, 0, 0));
+        nui.remove(Level::Window, at(0, 0, 1, 0));
+        assert_eq!(nui.sessions[0].workspaces.len(), 1);
         nui.remove(Level::Pane, at(0, 0, 0, 0));
         nui.remove(Level::Pane, at(0, 0, 0, 0));
         assert_eq!(nui.sessions.len(), 1);
@@ -1017,20 +1051,20 @@ pub(crate) mod tests {
     fn creation_goes_after_the_hovered_with_automatic_names() {
         let mut nui = sample();
         nui.sessions[0].active = 1;
-        // a window after the first: the active second one stays active, as third
+        // a workspace after the first: the active second one stays active, as third
         let new = nui
-            .create(Level::Window, at(0, 0, 1, 0), "sh", None)
+            .create(Level::Workspace, at(0, 0, 1, 0), "sh", None)
             .unwrap();
         assert_eq!(new, at(0, 1, 0, 0));
         assert_eq!(nui.sessions[0].active, 2);
-        let window = &nui.sessions[0].windows[1];
-        assert_eq!(window.name.as_deref(), Some("window-3"));
+        let workspace = &nui.sessions[0].workspaces[1];
+        assert_eq!(workspace.name.as_deref(), Some("workspace-3"));
         assert_eq!(
             (
-                window.tabs[0].name.as_deref(),
-                window.tabs[0].panes[0].name.as_deref()
+                workspace.windows[0].name.as_deref(),
+                workspace.windows[0].panes[0].name.as_deref()
             ),
-            (Some("tab-1"), Some("pane-1"))
+            (Some("window-1"), Some("pane-1"))
         );
         assert_eq!(
             nui.sessions[0]
@@ -1053,7 +1087,7 @@ pub(crate) mod tests {
     #[test]
     fn stop_and_enter() {
         let mut nui = sample();
-        nui.stop(Level::Window, at(0, 0, 0, 0));
+        nui.stop(Level::Workspace, at(0, 0, 0, 0));
         let status = |nui: &Nui, id| nui.sessions[0].terminal(id).unwrap().status;
         assert_eq!(status(&nui, 1), Status::Stopped);
         assert_eq!(status(&nui, 2), Status::Stopped);
@@ -1086,13 +1120,13 @@ pub(crate) mod tests {
     #[test]
     fn normalize_checks_invariants() {
         let mut nui = sample();
-        nui.sessions[0].windows[1].active = 7;
+        nui.sessions[0].workspaces[1].active = 7;
         nui.normalize().unwrap();
-        assert_eq!(nui.sessions[0].windows[1].active, 0);
-        nui.sessions[0].windows[1].tabs[0].panes.clear();
+        assert_eq!(nui.sessions[0].workspaces[1].active, 0);
+        nui.sessions[0].workspaces[1].windows[0].panes.clear();
         assert!(nui.normalize().is_err());
         let mut nui = sample();
-        nui.sessions[0].windows[0].tabs[0].panes[0].terminal = 9;
+        nui.sessions[0].workspaces[0].windows[0].panes[0].terminal = 9;
         assert!(nui.normalize().is_err());
     }
 }

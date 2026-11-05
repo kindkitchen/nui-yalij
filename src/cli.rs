@@ -31,6 +31,8 @@ usage: nui-yalij [--state <global.kdl>] [--config <dir>] [--profile <name>]
 commands:
   attach [<session>]  connect; create a missing session (the default command)
                      inside a pane, switch the instance that last typed there
+  call <command>     inside a pane, what a command of decoration runs, for the
+                     instance that last typed there: t opens navigation
   list               list sessions and connected instances, without starting them
   reload             reload global/profile decoration and plugin files
   kill [--apply]     observe, or stop this catalog's servers and all its clients
@@ -45,12 +47,12 @@ asks Apply? (N/y). Nothing executes before y, even with --apply.
 
 State: $XDG_STATE_HOME/nui-yalij/global-state.kdl (~/.local/state/...).
 Decoration: $XDG_CONFIG_HOME/nui-yalij (~/.config/...). Profiles are per
-instance; active tabs/panes are shared state. ctrl-g opens navigation:
-q disconnects only this instance; Q stops this catalog's servers.
+instance; active windows/panes are shared state. ctrl-g, or t inside a pane,
+opens navigation: q disconnects only this instance; Q stops this catalog's servers.
 ";
 
-const COMMANDS: [&str; 9] = [
-    "attach", "list", "reload", "kill", "server", "install", "update", "remove", "help",
+const COMMANDS: [&str; 10] = [
+    "attach", "call", "list", "reload", "kill", "server", "install", "update", "remove", "help",
 ];
 
 pub struct Options {
@@ -182,9 +184,16 @@ impl Options {
         if !COMMANDS.contains(&command) {
             return Err(format!("unknown command {command}; use help"));
         }
-        let maximum = if command == "attach" { 2 } else { 1 };
+        let (minimum, maximum) = match command {
+            "attach" => (1, 2),
+            "call" => (2, 2),
+            _ => (1, 1),
+        };
         if self.words.len() > maximum {
             return Err(format!("unexpected argument(s) for {command}"));
+        }
+        if self.words.len() < minimum {
+            return Err(format!("{command} needs an argument"));
         }
         Ok(())
     }
@@ -229,6 +238,25 @@ pub fn sessions(options: &Options) -> Result<Vec<Session>, String> {
     }
 }
 
+/// The session and terminal of the pane this runs in, when inside this catalog.
+fn inside(options: &Options) -> Result<Option<(u64, u64)>, String> {
+    let inside = env::var_os("NUI_YALIJ_STATE").and_then(|path| absolute(Path::new(&path)).ok())
+        == Some(options.state.clone());
+    if !inside {
+        return Ok(None);
+    }
+    let id = |name, what| {
+        env::var(name)
+            .ok()
+            .and_then(|id| id.parse().ok())
+            .ok_or(format!("missing inside-{what} identity"))
+    };
+    Ok(Some((
+        id("NUI_YALIJ_SESSION", "session")?,
+        id("NUI_YALIJ_TERMINAL", "terminal")?,
+    )))
+}
+
 pub fn run(mut options: Options) -> Result<(), String> {
     if options.repl && !complete(&mut options)? {
         return Ok(());
@@ -252,18 +280,7 @@ pub fn run(mut options: Options) -> Result<(), String> {
         }
         "attach" => {
             let target = options.words.get(1).cloned();
-            let inside = env::var_os("NUI_YALIJ_STATE")
-                .and_then(|path| absolute(Path::new(&path)).ok())
-                == Some(options.state.clone());
-            if inside {
-                let from_session = env::var("NUI_YALIJ_SESSION")
-                    .ok()
-                    .and_then(|id| id.parse().ok())
-                    .ok_or("missing inside-session identity")?;
-                let terminal = env::var("NUI_YALIJ_TERMINAL")
-                    .ok()
-                    .and_then(|id| id.parse().ok())
-                    .ok_or("missing inside-terminal identity")?;
+            if let Some((from_session, terminal)) = inside(&options)? {
                 let stream = client::connect(&options.state).map_err(|error| error.to_string())?;
                 let result = client::control(
                     stream,
@@ -280,6 +297,20 @@ pub fn run(mut options: Options) -> Result<(), String> {
                     return Err("attach needs a terminal".into());
                 }
                 return client::attach(client::start(&options)?, &options, target);
+            }
+        }
+        "call" => {
+            let (from_session, terminal) =
+                inside(&options)?.ok_or("call runs inside a pane of this catalog")?;
+            let stream = client::connect(&options.state).map_err(|error| error.to_string())?;
+            let request = Request::Call {
+                name: options.words[1].clone(),
+                from_session,
+                terminal,
+            };
+            let result = client::control(stream, request)?;
+            if !result.is_empty() {
+                println!("{result}");
             }
         }
         "list" => match client::connect(&options.state) {
@@ -314,10 +345,16 @@ fn complete(options: &mut Options) -> Result<bool, String> {
     }
     loop {
         if options.words.is_empty() {
-            let Some(index) = choose("Command", &COMMANDS.map(str::to_string))? else {
+            // call runs inside a pane, not from here
+            let commands: Vec<String> = COMMANDS
+                .into_iter()
+                .filter(|command| *command != "call")
+                .map(str::to_string)
+                .collect();
+            let Some(index) = choose("Command", &commands)? else {
                 return Ok(false);
             };
-            options.words.push(COMMANDS[index].into());
+            options.words.push(commands[index].clone());
         }
         if options.words == ["attach"] {
             let mut names: Vec<String> = sessions(options)?
@@ -440,6 +477,9 @@ mod tests {
         assert!(parse(&["--state"]).is_err());
         assert!(parse(&["--wat"]).is_err());
         assert!(parse(&["list", "extra"]).is_err());
+        assert!(parse(&["call"]).is_err());
+        assert!(parse(&["call", "t", "extra"]).is_err());
+        assert!(parse(&["call", "t"]).is_ok());
         assert!(parse(&["--profile", "../escape"]).is_err());
         let options = parse(&["kill", "--repl", "--apply", "--profile=work"]).unwrap();
         assert!(options.repl && options.apply);

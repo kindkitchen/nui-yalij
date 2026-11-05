@@ -18,9 +18,13 @@ use std::{
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::{app::Event, runtime::lock, store::mkdir};
+use crate::{
+    app::Event,
+    runtime::{Palette, lock},
+    store::mkdir,
+};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -34,11 +38,20 @@ pub enum Request {
         size: (u16, u16),
     },
     Input(crossterm::event::Event),
+    /// The colors of the terminal around an attached client, for programs asking.
+    Colors(Palette),
     Switch {
         session: Option<String>,
         from_session: u64,
         terminal: u64,
         cwd: Option<String>,
+    },
+    /// A command of decoration, run inside a terminal: for the instance that
+    /// typed there last.
+    Call {
+        name: String,
+        from_session: u64,
+        terminal: u64,
     },
     List,
     Reload,
@@ -49,7 +62,12 @@ pub enum Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
-    Ready { version: u32, client: u64 },
+    Ready {
+        version: u32,
+        client: u64,
+    },
+    /// Bytes for the terminal around the client: a drawing, and what programs
+    /// pass on to it, such as a copy to the clipboard.
     Frame(Vec<u8>),
     Result(Result<String, String>),
     Closed,

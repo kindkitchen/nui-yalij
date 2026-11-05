@@ -2,13 +2,13 @@
 //! snapshots (start/reload); the session layer is read live by its owner.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
-use kdl::{KdlDocument, KdlValue};
+use kdl::{KdlDocument, KdlNode, KdlValue};
 use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
     style::Color,
@@ -36,9 +36,14 @@ const ACTIONS: [(&str, &[&str]); 14] = [
     ("restart", &["enter"]),
 ];
 
+/// Commands inside the terminals of a session, as their default names:
+/// `t` opens and closes navigation, as the panel key does.
+const COMMANDS: [(&str, &[&str]); 1] = [("panel", &["t"])];
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Layer {
     pub keys: BTreeMap<String, Vec<String>>,
+    pub commands: BTreeMap<String, Vec<String>>,
     pub theme: BTreeMap<String, String>,
     pub plugins: Vec<String>,
 }
@@ -67,22 +72,29 @@ impl Default for Theme {
 #[derive(Clone, Debug)]
 pub struct Decoration {
     keys: BTreeMap<String, Vec<String>>,
+    commands: BTreeMap<String, Vec<String>>,
     pub theme: Theme,
     pub plugins: Vec<String>,
+}
+
+/// The bindings of actions, as named by default.
+fn defaults(actions: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+    actions
+        .iter()
+        .map(|(action, names)| {
+            (
+                action.to_string(),
+                names.iter().map(|name| name.to_string()).collect(),
+            )
+        })
+        .collect()
 }
 
 impl Default for Decoration {
     fn default() -> Self {
         Self {
-            keys: ACTIONS
-                .iter()
-                .map(|(action, keys)| {
-                    (
-                        action.to_string(),
-                        keys.iter().map(|key| key.to_string()).collect(),
-                    )
-                })
-                .collect(),
+            keys: defaults(&ACTIONS),
+            commands: defaults(&COMMANDS),
             theme: Theme::default(),
             plugins: Vec::new(),
         }
@@ -92,6 +104,7 @@ impl Default for Decoration {
 impl Decoration {
     fn overlay(&mut self, layer: &Layer) {
         self.keys.extend(layer.keys.clone());
+        self.commands.extend(layer.commands.clone());
         for (name, value) in &layer.theme {
             let color = Color::from_str(value).expect("validated color");
             match name.as_str() {
@@ -113,6 +126,13 @@ impl Decoration {
         self.keys
             .get(action)
             .is_some_and(|bound| bound.iter().any(|known| known == key))
+    }
+
+    /// Whether `name` is a command for `action`.
+    pub fn calls(&self, action: &str, name: &str) -> bool {
+        self.commands
+            .get(action)
+            .is_some_and(|names| names.iter().any(|known| known == name))
     }
 
     pub fn hint(&self, action: &str) -> &str {
@@ -172,40 +192,26 @@ impl Layer {
         let mut layer = Layer::default();
         let mut blocks = std::collections::HashSet::new();
         for node in doc.nodes() {
-            match node.name().value() {
+            let name = node.name().value();
+            if ["keys", "commands", "theme"].contains(&name) && !blocks.insert(name) {
+                return Err(format!("duplicate {name} block"));
+            }
+            match name {
                 "keys" => {
-                    check(node, "keys", &[], &ACTIONS.map(|(name, _)| name), 0)?;
-                    if !blocks.insert("keys") {
-                        return Err("duplicate keys block".into());
-                    }
-                    for binding in children(node) {
-                        let action = binding.name().value();
-                        let args = binding
-                            .entries()
-                            .iter()
-                            .filter(|entry| entry.name().is_none())
-                            .count();
-                        check(binding, action, &[], &[], args)?;
-                        let bound: Vec<String> = binding
-                            .entries()
-                            .iter()
-                            .map(|entry| {
-                                let key =
-                                    entry.value().as_string().ok_or("a key must be a string")?;
-                                keys::canonical(key).ok_or_else(|| format!("{key} is not a key"))
-                            })
-                            .collect::<Result<_, String>>()?;
-                        if layer.keys.insert(action.into(), bound).is_some() {
-                            return Err(format!("duplicate key action {action}"));
-                        }
-                    }
+                    layer.keys = actions(node, &ACTIONS, |key| {
+                        keys::canonical(key).ok_or_else(|| format!("{key} is not a key"))
+                    })?;
+                }
+                "commands" => {
+                    layer.commands = actions(node, &COMMANDS, |name| {
+                        valid_command(name)
+                            .then(|| name.to_string())
+                            .ok_or_else(|| format!("{name} is not a command name"))
+                    })?;
                 }
                 "theme" => {
                     let names = ["accent", "active", "muted", "notice", "error"];
                     check(node, "theme", &names, &[], 0)?;
-                    if !blocks.insert("theme") {
-                        return Err("duplicate theme block".into());
-                    }
                     for entry in node.entries() {
                         let name = entry.name().unwrap().value();
                         let color = entry
@@ -250,6 +256,53 @@ pub struct Library {
     pub root: PathBuf,
     global: Layer,
     profiles: HashMap<String, Layer>,
+}
+
+/// A block of actions, each bound to the names its arguments give, in the
+/// canonical form of `value`; one without arguments is unbound.
+fn actions(
+    node: &KdlNode,
+    known: &[(&str, &[&str])],
+    value: impl Fn(&str) -> Result<String, String>,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let block = node.name().value();
+    let names: Vec<&str> = known.iter().map(|(name, _)| *name).collect();
+    check(node, block, &[], &names, 0)?;
+    let mut actions = BTreeMap::new();
+    for binding in children(node) {
+        let action = binding.name().value();
+        let args = binding
+            .entries()
+            .iter()
+            .filter(|entry| entry.name().is_none())
+            .count();
+        check(binding, action, &[], &[], args)?;
+        let bound: Vec<String> = binding
+            .entries()
+            .iter()
+            .map(|entry| {
+                let name = entry
+                    .value()
+                    .as_string()
+                    .ok_or_else(|| format!("{block}: {action} takes strings"))?;
+                value(name)
+            })
+            .collect::<Result<_, String>>()?;
+        if actions.insert(action.to_string(), bound).is_some() {
+            return Err(format!("{block}: duplicate action {action}"));
+        }
+    }
+    Ok(actions)
+}
+
+/// A command name: a file name a shell runs as it is.
+pub fn valid_command(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['.', '-'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.+".contains(c))
 }
 
 pub fn valid_profile(name: &str) -> bool {
@@ -304,6 +357,16 @@ impl Library {
         Ok(decoration)
     }
 
+    /// The names of the commands any viewer of a session may call, of every
+    /// profile: each one tells whether a name is its own.
+    pub fn commands(&self, session: &Layer) -> BTreeSet<String> {
+        std::iter::once(None)
+            .chain(self.profiles.keys().map(|name| Some(name.as_str())))
+            .filter_map(|profile| self.effective(profile, session).ok())
+            .flat_map(|decoration| decoration.commands.into_values().flatten())
+            .collect()
+    }
+
     /// Automatic hooks never depend on the profile of an attached viewer.
     pub fn hooks(&self, session: &Layer) -> Vec<String> {
         let mut decoration = Decoration::default();
@@ -349,6 +412,38 @@ mod tests {
     }
 
     #[test]
+    fn commands_are_named_per_layer() {
+        let layer = |text| Layer::decode(text, Path::new("/config")).unwrap();
+        let library = Library {
+            root: PathBuf::new(),
+            global: Layer::default(),
+            profiles: HashMap::from([
+                ("work".into(), layer("commands { panel w nav }")),
+                ("quiet".into(), layer("commands { panel }")),
+            ]),
+        };
+        let plain = library.effective(None, &Layer::default()).unwrap();
+        assert!(plain.calls("panel", "t") && !plain.calls("panel", "w"));
+        let work = library.effective(Some("work"), &Layer::default()).unwrap();
+        assert!(work.calls("panel", "nav") && !work.calls("panel", "t"));
+        assert!(
+            !library
+                .effective(Some("quiet"), &Layer::default())
+                .unwrap()
+                .calls("panel", "t")
+        );
+        assert_eq!(
+            library.commands(&Layer::default()),
+            BTreeSet::from(["nav".into(), "t".into(), "w".into()])
+        );
+        // a session's own wins over every profile
+        assert_eq!(
+            library.commands(&layer("commands { panel s }")),
+            BTreeSet::from(["s".into()])
+        );
+    }
+
+    #[test]
     fn invalid_configuration_is_not_silently_accepted() {
         for text in [
             "attached 2",
@@ -356,6 +451,10 @@ mod tests {
             "theme accent=notacolor",
             "plugin foo bad=1",
             "keys { nope x }",
+            "commands { panel ../t }",
+            "commands { panel -t }",
+            "commands { nope x }",
+            "commands { panel t }\ncommands { panel t }",
         ] {
             assert!(Layer::decode(text, Path::new(".")).is_err(), "{text}");
         }

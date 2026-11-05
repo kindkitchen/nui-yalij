@@ -5,26 +5,27 @@
 //! attached 1
 //! session "main" active=1 {
 //!     terminal 1 command="/bin/zsh" cwd="/home/me" pid=4242 program="vim"
-//!     window {
-//!         tab layout="columns" {
+//!     workspace {
+//!         window layout="columns" {
 //!             pane terminal=1
 //!             pane "logs" terminal=1
 //!         }
 //!     }
 //! }
-//! navigation focus="pane" session=1 window=1 tab=1 pane=2 {
+//! navigation focus="pane" session=1 workspace=1 window=1 pane=2 {
 //!     rename "draft"
 //! }
 //! ```
 //!
 //! Indices count from 1. Defaults are left out when writing: `layout="tabs"`,
-//! `active=1`, `status="running"`.
+//! `active=1`, `status="running"`. The older shape, sessions of `window`s of
+//! `tab`s, still reads: the same levels under their former names.
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use crate::state::{
-    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session, Status, Tab,
-    Terminal, Window,
+    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session, Status, Terminal,
+    Window, Workspace,
 };
 
 const HEADER: &str = "// nui-yalij state: the single source of truth, applied live when changed.\n";
@@ -64,11 +65,16 @@ fn session(session: &Session) -> KdlNode {
     for terminal in &session.terminals {
         node = node.child(self::terminal(terminal));
     }
-    for window in &session.windows {
-        let mut child = container(named("window", &window.name), &window.layout, window.active);
-        for tab in &window.tabs {
-            let mut grandchild = container(named("tab", &tab.name), &tab.layout, tab.active);
-            for pane in &tab.panes {
+    for workspace in &session.workspaces {
+        let mut child = container(
+            named("workspace", &workspace.name),
+            &workspace.layout,
+            workspace.active,
+        );
+        for window in &workspace.windows {
+            let mut grandchild =
+                container(named("window", &window.name), &window.layout, window.active);
+            for pane in &window.panes {
                 grandchild = grandchild.child(
                     named("pane", &pane.name)
                         .prop("terminal", pane.terminal as i128)
@@ -297,36 +303,39 @@ impl<'a> Decoder<'a> {
             active: entries.index("active")?.unwrap_or(0),
             ..Session::default()
         };
-        for child in self.children(node, &["terminal", "window"])? {
+        for child in self.children(node, &["terminal", "workspace", "window"])? {
             match child.name().value() {
                 "terminal" => session.terminals.push(self.terminal(child)?),
-                _ => session.windows.push(self.window(child)?),
+                // the older shape: a window of tabs is a workspace of windows
+                "window" => session.workspaces.push(self.workspace(child, "tab")?),
+                _ => session.workspaces.push(self.workspace(child, "window")?),
             }
         }
         Ok(session)
     }
 
-    fn window(&self, node: &KdlNode) -> Result<Window, String> {
+    /// A workspace, its windows in children named `window`.
+    fn workspace(&self, node: &KdlNode, window: &str) -> Result<Workspace, String> {
         let entries = self.read(node, &["layout", "active"])?;
-        let tabs = self
-            .children(node, &["tab"])?
+        let windows = self
+            .children(node, &[window])?
             .into_iter()
-            .map(|child| self.tab(child));
-        Ok(Window {
+            .map(|child| self.window(child));
+        Ok(Workspace {
             name: entries.optional_string_arg()?,
             layout: entries.layout()?,
             active: entries.index("active")?.unwrap_or(0),
-            tabs: tabs.collect::<Result<_, _>>()?,
+            windows: windows.collect::<Result<_, _>>()?,
         })
     }
 
-    fn tab(&self, node: &KdlNode) -> Result<Tab, String> {
+    fn window(&self, node: &KdlNode) -> Result<Window, String> {
         let entries = self.read(node, &["layout", "active"])?;
         let panes = self
             .children(node, &["pane"])?
             .into_iter()
             .map(|child| self.pane(child));
-        Ok(Tab {
+        Ok(Window {
             name: entries.optional_string_arg()?,
             layout: entries.layout()?,
             active: entries.index("active")?.unwrap_or(0),
@@ -391,13 +400,25 @@ impl<'a> Decoder<'a> {
     }
 
     fn navigation(&self, node: &KdlNode) -> Result<Navigation, String> {
-        let entries = self.read(node, &["focus", "session", "window", "tab", "pane"])?;
+        let entries = self.read(
+            node,
+            &["focus", "session", "workspace", "window", "tab", "pane"],
+        )?;
         let focus = entries.string("focus")?.unwrap_or_else(|| "pane".into());
-        let focus = Level::parse(&focus)
+        // the older shape named workspaces `window` and windows `tab`
+        let older = node.get("tab").is_some() || focus == "tab";
+        let name = |level: Level| match (older, level) {
+            (true, Level::Workspace) => "window",
+            (true, Level::Window) => "tab",
+            _ => level.name(),
+        };
+        let focus = Level::ALL
+            .into_iter()
+            .find(|level| name(*level) == focus)
             .ok_or_else(|| self.error(node, &format!("unknown focus {focus}")))?;
         let mut cursor = Location::default();
         for level in Level::ALL {
-            cursor.set(level, entries.index(level.name())?.unwrap_or(0));
+            cursor.set(level, entries.index(name(level))?.unwrap_or(0));
         }
         let mut operation = None;
         for child in self.children(node, &["rename", "create", "remove", "stop"])? {
@@ -509,13 +530,13 @@ mod tests {
         terminal.status = Status::Exited;
         terminal.exit = Some(2);
         terminal.title = Some("a \"quoted\" title".into());
-        nui.sessions[0].windows[0].tabs[0].panes[0].name = Some("logs".into());
+        nui.sessions[0].workspaces[0].windows[0].panes[0].name = Some("logs".into());
         nui.navigation = Some(Navigation {
-            focus: Level::Tab,
+            focus: Level::Window,
             cursor: Location {
                 session: 0,
-                window: 0,
-                tab: 1,
+                workspace: 0,
+                window: 1,
                 pane: 0,
             },
             operation: Some(Operation::Rename {
@@ -536,21 +557,55 @@ mod tests {
         let text = r#"
             session main {
                 terminal 1 command=nu
-                window "dev" { tab { pane terminal=1; pane "again" terminal=1 } }
+                workspace "dev" { window { pane terminal=1; pane "again" terminal=1 } }
             }
         "#;
         let nui = decode(text).unwrap();
-        let tab = &nui.sessions[0].windows[0].tabs[0];
-        assert_eq!((tab.layout.as_str(), tab.panes.len()), ("tabs", 2));
-        assert_eq!(nui.sessions[0].windows[0].name.as_deref(), Some("dev"));
+        let window = &nui.sessions[0].workspaces[0].windows[0];
+        assert_eq!((window.layout.as_str(), window.panes.len()), ("tabs", 2));
+        assert_eq!(nui.sessions[0].workspaces[0].name.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn reads_the_older_shape() {
+        let older = r#"
+            session main active=2 {
+                terminal 1 command=nu
+                window "dev" { tab "logs" { pane terminal=1 } }
+                window { tab layout=columns { pane terminal=1 }; tab { pane terminal=1 } }
+            }
+            navigation focus=tab session=1 window=2 tab=2 pane=1
+        "#;
+        let nui = decode(older).unwrap();
+        let session = &nui.sessions[0];
+        assert_eq!(session.active, 1);
+        assert_eq!(session.workspaces[0].name.as_deref(), Some("dev"));
+        assert_eq!(
+            session.workspaces[0].windows[0].name.as_deref(),
+            Some("logs")
+        );
+        assert_eq!(session.workspaces[1].windows[0].layout, "columns");
+        let navigation = nui.navigation.as_ref().unwrap();
+        assert_eq!(navigation.focus, Level::Window);
+        assert_eq!(
+            (navigation.cursor.workspace, navigation.cursor.window),
+            (1, 1)
+        );
+        // and is written in the current one
+        let text = encode(&nui);
+        assert!(
+            !text.contains("tab ") && text.contains("workspace=2 window=2"),
+            "{text}"
+        );
+        assert_eq!(decode(&text).unwrap(), nui);
     }
 
     #[test]
     fn errors_say_where() {
         let error =
-            decode("session main {\n  window {\n    tab layuot=columns\n  }\n}").unwrap_err();
+            decode("session main {\n  workspace {\n    window layuot=columns\n  }\n}").unwrap_err();
         assert!(
-            error.starts_with("line 3, tab: unknown property layuot"),
+            error.starts_with("line 3, window: unknown property layuot"),
             "{error}"
         );
         assert!(decode("session main {").unwrap_err().starts_with("line 1"));

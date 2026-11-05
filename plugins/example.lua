@@ -4,7 +4,7 @@
 -- paths are relative to that decoration file, or from ~/:
 --   plugin "~/path/to/plugins/example.lua"
 --
--- layouts: columns, rows, and bar: a bar of tabs over the active child
+-- layouts: columns, rows, and bar: a bar naming the children over the active one
 -- keys in the panel: n  a new item after the hovered one, with a new terminal
 --                    c  the next layout of the section's container
 -- update: panes whose terminal ended well close, as in most multiplexers
@@ -58,8 +58,8 @@ local function terminal(state, session)
 end
 
 local function pane(state, session) return { terminal = terminal(state, session) } end
-local function tab(state, session) return { panes = { pane(state, session) } } end
-local function window(state, session) return { tabs = { tab(state, session) } } end
+local function window(state, session) return { panes = { pane(state, session) } } end
+local function workspace(state, session) return { windows = { window(state, session) } } end
 
 -- Insert `item` at `index`, keeping `owner[key]` on the item it was on.
 local function insert(list, index, item, owner, key)
@@ -84,18 +84,18 @@ M.keys = {
       local session = state.sessions[at.session]
       if focus == "session" then
         local index = at.session + 1
-        insert(state.sessions, index, { name = unique(state), terminals = {}, windows = {} }, state, "attached")
-        state.sessions[index].windows = { window(state, index) }
-        at.session, at.window, at.tab, at.pane = index, 1, 1, 1
+        insert(state.sessions, index, { name = unique(state), terminals = {}, workspaces = {} }, state, "attached")
+        state.sessions[index].workspaces = { workspace(state, index) }
+        at.session, at.workspace, at.window, at.pane = index, 1, 1, 1
+      elseif focus == "workspace" then
+        insert(session.workspaces, at.workspace + 1, workspace(state, at.session), session, "active")
+        at.workspace, at.window, at.pane = at.workspace + 1, 1, 1
       elseif focus == "window" then
-        insert(session.windows, at.window + 1, window(state, at.session), session, "active")
-        at.window, at.tab, at.pane = at.window + 1, 1, 1
-      elseif focus == "tab" then
-        local parent = session.windows[at.window]
-        insert(parent.tabs, at.tab + 1, tab(state, at.session), parent, "active")
-        at.tab, at.pane = at.tab + 1, 1
+        local parent = session.workspaces[at.workspace]
+        insert(parent.windows, at.window + 1, window(state, at.session), parent, "active")
+        at.window, at.pane = at.window + 1, 1
       else
-        local parent = session.windows[at.window].tabs[at.tab]
+        local parent = session.workspaces[at.workspace].windows[at.window]
         insert(parent.panes, at.pane + 1, pane(state, at.session), parent, "active")
         at.pane = at.pane + 1
       end
@@ -103,8 +103,8 @@ M.keys = {
     c = function(state)
       local focus, at = state.navigation.focus, state.navigation.cursor
       local session = state.sessions[at.session]
-      local window = session.windows[at.window]
-      local container = ({ window = session, tab = window, pane = window.tabs[at.tab] })[focus]
+      local workspace = session.workspaces[at.workspace]
+      local container = ({ workspace = session, window = workspace, pane = workspace.windows[at.window] })[focus]
       if not container then
         return print("sessions have no layout: one is attached at a time")
       end
@@ -121,10 +121,10 @@ local function ended(state)
     for _, terminal in ipairs(session.terminals) do
       done[terminal.id] = terminal.status == "exited" and terminal.exit == 0
     end
-    for w, window in ipairs(session.windows) do
-      for t, tab in ipairs(window.tabs) do
-        for p, pane in ipairs(tab.panes) do
-          if done[pane.terminal] then return { session = s, window = w, tab = t, pane = p } end
+    for w, workspace in ipairs(session.workspaces) do
+      for v, window in ipairs(workspace.windows) do
+        for p, pane in ipairs(window.panes) do
+          if done[pane.terminal] then return { session = s, workspace = w, window = v, pane = p } end
         end
       end
     end

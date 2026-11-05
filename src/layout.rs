@@ -12,7 +12,7 @@ use crate::state::{Level, Location, Nui};
 
 /// A container about to place its children.
 pub struct Container {
-    /// The level of the container: a session places windows, and so on.
+    /// The level of the container: a session places workspaces, and so on.
     pub kind: Level,
     pub area: Rect,
     pub active: usize,
@@ -28,7 +28,7 @@ pub struct Placement {
     pub draws: Vec<Draw>,
 }
 
-/// Text a layout draws, e.g. a bar of tabs.
+/// Text a layout draws, e.g. a bar naming the children.
 pub struct Draw {
     pub x: u16,
     pub y: u16,
@@ -44,7 +44,10 @@ pub fn tabs(container: &Container) -> Placement {
     if let Some(area) = areas.get_mut(container.active) {
         *area = Some(container.area);
     }
-    Placement { areas, draws: Vec::new() }
+    Placement {
+        areas,
+        draws: Vec::new(),
+    }
 }
 
 /// What a node shows in an area: its visible panes and what layouts drew.
@@ -88,35 +91,58 @@ fn walk(
     }
     let (layout, active, count) = match level {
         Level::Session => match nui.sessions.get(at.session) {
-            Some(session) => (&session.layout, session.active, session.windows.len()),
+            Some(session) => (&session.layout, session.active, session.workspaces.len()),
+            None => return,
+        },
+        Level::Workspace => match nui.workspace(at) {
+            Some(workspace) => (&workspace.layout, workspace.active, workspace.windows.len()),
             None => return,
         },
         Level::Window => match nui.window(at) {
-            Some(window) => (&window.layout, window.active, window.tabs.len()),
-            None => return,
-        },
-        Level::Tab => match nui.tab(at) {
-            Some(tab) => (&tab.layout, tab.active, tab.panes.len()),
+            Some(window) => (&window.layout, window.active, window.panes.len()),
             None => return,
         },
         Level::Pane => {
             if let Some(pane) = nui.pane(at) {
-                scene.panes.push(Shown { at, terminal: pane.terminal, area });
+                scene.panes.push(Shown {
+                    at,
+                    terminal: pane.terminal,
+                    area,
+                });
             }
             return;
         }
     };
     let child = level.step(1);
-    let children = (0..count).map(|index| nui.label(child, at.with(child, index))).collect();
-    let placement = place(layout, &Container { kind: level, area, active, children });
+    let children = (0..count)
+        .map(|index| nui.label(child, at.with(child, index)))
+        .collect();
+    let placement = place(
+        layout,
+        &Container {
+            kind: level,
+            area,
+            active,
+            children,
+        },
+    );
     // a layout draws inside its own area only
-    scene.draws.extend(placement.draws.into_iter().filter_map(|mut draw| {
-        draw.width = draw.width.min(area.right().saturating_sub(draw.x));
-        area.contains(Position::new(draw.x, draw.y)).then_some(draw)
-    }));
+    scene
+        .draws
+        .extend(placement.draws.into_iter().filter_map(|mut draw| {
+            draw.width = draw.width.min(area.right().saturating_sub(draw.x));
+            area.contains(Position::new(draw.x, draw.y)).then_some(draw)
+        }));
     for (index, child_area) in placement.areas.into_iter().enumerate().take(count) {
         if let Some(child_area) = child_area {
-            walk(nui, child, at.with(child, index), child_area.intersection(area), place, scene);
+            walk(
+                nui,
+                child,
+                at.with(child, index),
+                child_area.intersection(area),
+                place,
+                scene,
+            );
         }
     }
 }
@@ -130,12 +156,26 @@ mod tests {
     fn tabs_show_the_active_path() {
         let nui = sample();
         let area = Rect::new(0, 0, 80, 24);
-        let scene = scene(&nui, Level::Session, Location::default(), area, &mut |_, container| tabs(container));
+        let scene = scene(
+            &nui,
+            Level::Session,
+            Location::default(),
+            area,
+            &mut |_, container| tabs(container),
+        );
         assert_eq!(scene.panes.len(), 1);
-        assert_eq!((scene.panes[0].at, scene.panes[0].area), (Location::default(), area));
-        // a window shows its own active tab, whatever the session shows
-        let at = Location { window: 1, ..Location::default() };
-        let scene = self::scene(&nui, Level::Window, at, area, &mut |_, container| tabs(container));
+        assert_eq!(
+            (scene.panes[0].at, scene.panes[0].area),
+            (Location::default(), area)
+        );
+        // a workspace shows its own active window, whatever the session shows
+        let at = Location {
+            workspace: 1,
+            ..Location::default()
+        };
+        let scene = self::scene(&nui, Level::Workspace, at, area, &mut |_, container| {
+            tabs(container)
+        });
         assert_eq!(scene.panes[0].terminal, 3);
     }
 
@@ -145,12 +185,27 @@ mod tests {
         let columns = |container: &Container| {
             let width = container.area.width / container.children.len() as u16;
             let areas = (0..container.children.len() as u16)
-                .map(|i| Some(Rect { x: container.area.x + i * width, width, ..container.area }))
+                .map(|i| {
+                    Some(Rect {
+                        x: container.area.x + i * width,
+                        width,
+                        ..container.area
+                    })
+                })
                 .collect();
-            Placement { areas, draws: Vec::new() }
+            Placement {
+                areas,
+                draws: Vec::new(),
+            }
         };
         let area = Rect::new(0, 0, 80, 24);
-        let scene = scene(&nui, Level::Tab, Location::default(), area, &mut |_, container| columns(container));
+        let scene = scene(
+            &nui,
+            Level::Window,
+            Location::default(),
+            area,
+            &mut |_, container| columns(container),
+        );
         let xs: Vec<u16> = scene.panes.iter().map(|shown| shown.area.x).collect();
         assert_eq!(xs, [0, 40]);
     }

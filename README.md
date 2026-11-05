@@ -13,7 +13,7 @@ No installation or PATH registration needed:
 
 ```nu
 cargo run --release -- attach main
-# In another terminal: the same processes and shared active tabs/panes.
+# In another terminal: the same processes and shared active windows/panes.
 ./target/release/nui-yalij attach main
 # A different session, in the same catalog.
 ./target/release/nui-yalij attach other
@@ -34,8 +34,8 @@ reacts to the same update.
 
 Closing an instance disconnects it; its sessions keep running. A terminal shared
 by differently sized instances takes the size of the instance that typed last.
-The navigation cursor/prompt is per instance, but active windows, tabs, panes,
-layout names and terminal status are shared.
+The navigation cursor/prompt is per instance, but active workspaces, windows,
+panes, layout names and terminal status are shared.
 
 ## Commands
 
@@ -48,6 +48,8 @@ layout names and terminal status are shared.
 ./target/release/nui-yalij --repl
 ./target/release/nui-yalij attach --repl
 ./target/release/nui-yalij kill --repl
+# Inside a pane only: what a command of decoration runs (t, by default).
+nui-yalij call t
 ```
 
 `--state <global.kdl>` selects a catalog; different catalogs are independent.
@@ -57,6 +59,12 @@ a catalog must use the same config directory; `--profile <name>` is per instance
 Inside a pane, `nui-yalij attach other` switches the connected instance that last
 typed into that terminal, not every viewer. The spawned shell inherits
 `NUI_YALIJ_STATE`, `NUI_YALIJ_SESSION` and `NUI_YALIJ_TERMINAL` for this routing.
+
+Inside a pane, `t` opens/closes navigation for the instance that last typed
+there, as `ctrl-g` does. It is a command of decoration, not an installed
+program: each session writes its commands as scripts into
+`<global.kdl>.sessions/<id>/bin`, first on the `PATH` of its terminals, so they
+exist nowhere else. A shell alias or function of the same name shadows them.
 
 **REPL:** complete a command with j/k or arrows, enter to choose, esc to go back
 (or cancel at the root). Choose an existing session or name a new one. The
@@ -71,10 +79,10 @@ partial uninstall is provided yet.
 
 ## Primitives and keys
 
-`Session -> Window -> Tab -> Pane`, each container holding at least one child.
+`Session -> Workspace -> Window -> Pane`, each container holding at least one child.
 
 - A **session** owns terminals, independently persisted.
-- **Windows** and **tabs** are groupings, each a marker of one visualization.
+- **Workspaces** and **windows** are groupings, each a marker of one visualization.
 - A **pane** shows a terminal by id; many panes may show the same terminal.
 - A container's layout strategy places its children. Built-in `tabs` shows the
   active child; plugins provide other strategies.
@@ -83,7 +91,7 @@ Default keys (overridable by decoration):
 
 | Where      | Key         | Action |
 |------------|-------------|--------|
-| view       | ctrl-g      | Open/close navigation |
+| view       | ctrl-g      | Open/close navigation (`t` in a pane does too) |
 | view       | enter       | Restart the focused stopped/exited terminal |
 | navigation | h/l, ←/→    | Focus the section left/right |
 | navigation | j/k, ↓/↑    | Hover next/previous; sections to the right follow |
@@ -96,7 +104,7 @@ Default keys (overridable by decoration):
 
 Adding creates one of every child level down to a new shell, in the hovered
 terminal's directory. Enter takes a typed name and continues naming the next
-level; esc keeps the remaining automatic names (`window-2`, `tab-1`, etc.).
+level; esc keeps the remaining automatic names (`workspace-2`, `window-1`, etc.).
 
 Removing cascades through empty containers and drops terminals no pane shows
 anymore. Stopping keeps structure; enter restarts the terminal.
@@ -114,7 +122,7 @@ catalog version=1 {
     session 1
     session 4
     client 7 session=1 profile=work {
-        navigation focus=pane session=4 window=1 tab=1 pane=2
+        navigation focus=pane session=4 workspace=1 window=1 pane=2
         message "the last notice"
     }
     client 8 session=4
@@ -136,8 +144,8 @@ session main id=4 active=1 {
     terminal 2 command=htop status=stopped {
         args "-d" "10"
     }
-    window dev {
-        tab layout=columns {
+    workspace dev {
+        window layout=columns {
             pane terminal=1
             pane monitor terminal=2
         }
@@ -147,8 +155,9 @@ session main id=4 active=1 {
 
 The session id stays fixed across renames and catalog reordering. Terminal ids
 are local to a session. Defaults are `layout=tabs`, `active=1`, `status=running`;
-other statuses are `stopped` and `exited`. Unnamed windows/tabs/panes derive their
-labels from what they show.
+other statuses are `stopped` and `exited`. Unnamed workspaces/windows/panes derive
+their labels from what they show. The earlier shape, sessions of `window`s of
+`tab`s, still reads as the same levels and is written in the current one.
 
 Each file has one locked writer. Client input, runtime facts, plugins and file
 edits are serialized; clients send **events, never stale replacement states**.
@@ -199,16 +208,22 @@ keys {
     quit Q
     restart enter
 }
+commands {
+    panel t
+}
 theme accent=blue active=green muted=darkgray notice=yellow error=red
 plugin "~/path/to/plugins/example.lua"
 ```
 
-Later layers replace individual key actions and theme fields; a key action with
-no arguments disables it. Plugin lists accumulate, later entries take precedence,
+Later layers replace individual key and command actions and theme fields; an
+action with no arguments disables it. Keys may hold `ctrl-`, `alt-`, `super-`
+and `shift-`. Command names are plain file names. Every profile's commands are
+written into a session, but a call only works for the calling instance's own;
+`reload` and live session edits rewrite them. Plugin lists accumulate, later entries take precedence,
 and duplicate paths load once. Paths are relative to **their decoration file**,
 or start with `~/`. Unknown nodes, actions, properties, keys and colors are errors.
 
-A profile decorates its instance; it cannot impose active tabs, layout names or
+A profile decorates its instance; it cannot impose active windows, layout names or
 other session state. Attaching/reloading a profile never runs its automatic
 `update` hooks. Its layouts and explicitly invoked key handlers can differ, but
 a user's explicit state-changing action is still shared. A session override
@@ -219,6 +234,34 @@ decoration retains the previous valid layer until fixed. `reload` also re-reads
 plugin source files even if their paths have not changed; editing a Lua source
 alone does not hot-reload it.
 
+## Terminals inside
+
+The terminal of a pane emulates what programs ask of a modern one, and the
+client asks the terminal around it on attach, giving everything back on exit:
+
+- **Keys told apart:** kitty's keyboard protocol (its disambiguate flag; a
+  program pushing more flags gets that one and can ask which), or xterm's
+  `modifyOtherKeys`, per program and per screen, so shift+enter reaches Pi as
+  shift+enter. The client reads keys in any encoding of the terminal around; a
+  program asking for neither gets enter.
+- **Layouts:** ctrl, alt or super with a key counts as the key of the base
+  layout, when the terminal around tells it: `ctrl-g` opens navigation on a
+  Ukrainian layout too.
+- **Focus** (DEC 1004), **colors** (OSC 10/11/4) and the **color scheme**
+  (`CSI ? 996 n`, DEC 2031): from the terminal around the instance that typed
+  there last; a change of scheme reaches the programs asking.
+- **Synchronized output** (DEC 2026): an update shows whole, or once it took
+  over 200 ms.
+- **Passed on** to the terminal around: copies to the clipboard (OSC 52, to the
+  instance that typed there last), notifications (OSC 9, 777), progress
+  (OSC 9;4), bells, and the title of the focused pane. Reading the clipboard is
+  not passed on.
+- **In navigation:** progress shows by its pane (and the containers above it)
+  as a percentage or `working`, a bell nobody saw as `bell` until the pane is
+  focused.
+
+A full reset (`reset`, RIS) forgets what a program asked, as after a crash.
+
 ## Plugins
 
 Lua 5.4 scripts return a table. Scripts are trusted code, not sandboxed.
@@ -227,7 +270,8 @@ Lua 5.4 scripts return a table. Scripts are trusted code, not sandboxed.
 return {
   layouts = {
     columns = function(container)
-      -- kind, area={x,y,w,h}, active (1-based), children={{name}}, theme
+      -- kind (session, workspace, window), area={x,y,w,h},
+      -- active (1-based), children={{name}}, theme
       return {
         areas = { [1] = { x=0, y=0, w=40, h=24 } },
         draw = { { x=0, y=0, text="…", style={fg=container.theme.accent} } },
@@ -253,7 +297,10 @@ return {
 ```
 
 Handlers return a new state or nothing to keep their in-place edits. Existing
-one-argument handlers still work. Session tables now have a stable `id`.
+one-argument handlers still work. Session tables have a stable `id`, and
+`workspaces` of `windows` of `panes`; levels and locations name `session`,
+`workspace`, `window` and `pane`. Plugins of the earlier shape, with `windows`
+of `tabs`, need the new names.
 Layouts/keys from later plugins override earlier plugins and built-ins; automatic
 hooks run in global/session order. `print` is reported as a notice.
 
@@ -274,8 +321,9 @@ cargo clippy --all-targets -- -D warnings
 
 Tests include real multi-client PTYs, same/different sessions, foreign-session
 navigation edits, concurrent startup, live files, reconnect/restart, per-instance
-profiles, decoration precedence/reload, inside attach, resize ownership, REPL
-confirmation, and forced shutdown.
+profiles, decoration precedence/reload, inside attach and commands, resize
+ownership, REPL confirmation, forced shutdown, and the conversations of programs
+with the terminal around (keys, focus, colors, clipboard, titles, progress).
 
 PTY content stays in memory: disconnect/reconnect preserves it, server restart
 does not. State persists and starts the terminals that should run again. No

@@ -231,8 +231,8 @@ fn globals(lua: &Lua, notices: Rc<RefCell<Vec<String>>>, shell: &str) -> mlua::R
         })?,
     )?;
     // the operations of the navigation panel, as functions of a state:
-    // nui.remove(state, "tab", location), with a location like
-    // { session = 1, window = 1, tab = 2, pane = 1 }
+    // nui.remove(state, "window", location), with a location like
+    // { session = 1, workspace = 1, window = 2, pane = 1 }
     nui.set(
         "remove",
         operation(lua, |nui, level, at| nui.remove(level, at))?,
@@ -292,7 +292,9 @@ fn to_lua(lua: &Lua, nui: &Nui) -> mlua::Result<Value> {
 
 fn level_of(name: &str) -> mlua::Result<Level> {
     Level::parse(name).ok_or_else(|| {
-        mlua::Error::runtime(format!("{name} is no level: session, window, tab or pane"))
+        mlua::Error::runtime(format!(
+            "{name} is no level: session, workspace, window or pane"
+        ))
     })
 }
 
@@ -387,7 +389,7 @@ mod tests {
             end } }"#,
         );
         let container = Container {
-            kind: Level::Tab,
+            kind: Level::Window,
             area: Rect::new(0, 0, 10, 5),
             active: 1,
             children: vec!["a".into(), "b".into()],
@@ -409,19 +411,19 @@ mod tests {
                     local id = nui.next_id(state)
                     local session = state.sessions[1]
                     table.insert(session.terminals, { id = id, command = nui.shell })
-                    table.insert(session.windows[1].tabs[1].panes, { terminal = id })
+                    table.insert(session.workspaces[1].windows[1].panes, { terminal = id })
                 end } },
                 update = function(state)
-                    local location = { session = 1, window = 1, tab = 1, pane = 1 }
-                    print("panes", #state.sessions[1].windows[1].tabs[1].panes)
+                    local location = { session = 1, workspace = 1, window = 1, pane = 1 }
+                    print("panes", #state.sessions[1].workspaces[1].windows[1].panes)
                     return nui.stop(state, "pane", location)
                 end,
             }"#,
         );
         let next = plugins.key("navigate", "n", &sample()).unwrap().unwrap();
-        let tab = &next.sessions[0].windows[0].tabs[0];
-        assert_eq!(tab.panes.len(), 3);
-        assert_eq!(tab.panes[2].terminal, 4);
+        let window = &next.sessions[0].workspaces[0].windows[0];
+        assert_eq!(window.panes.len(), 3);
+        assert_eq!(window.panes[2].terminal, 4);
         assert!(plugins.key("view", "n", &next).is_none());
         let hooked = plugins.update(next).unwrap();
         assert_eq!(hooked.sessions[0].terminals[0].status, Status::Stopped);

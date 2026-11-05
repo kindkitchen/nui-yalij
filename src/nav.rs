@@ -205,8 +205,10 @@ fn name(nui: &Nui, level: Level, at: Location) -> String {
             .sessions
             .get(at.session)
             .map(|session| session.name.clone()),
+        Level::Workspace => nui
+            .workspace(at)
+            .and_then(|workspace| workspace.name.clone()),
         Level::Window => nui.window(at).and_then(|window| window.name.clone()),
-        Level::Tab => nui.tab(at).and_then(|tab| tab.name.clone()),
         Level::Pane => nui.pane(at).and_then(|pane| pane.name.clone()),
     };
     name.unwrap_or_default()
@@ -242,26 +244,26 @@ mod tests {
         open(&mut nui);
         assert_eq!(cursor(&nui), (Level::Pane, Location::default()));
         press(&mut nui, "hhj");
-        // the second window, and its active tab and pane
+        // the second workspace, and its active window and pane
         assert_eq!(
             cursor(&nui),
             (
-                Level::Window,
+                Level::Workspace,
                 Location {
-                    window: 1,
+                    workspace: 1,
                     ..Location::default()
                 }
             )
         );
         press(&mut nui, "jjjk");
-        assert_eq!(cursor(&nui).1.window, 0);
-        // enter on a window moves to its tabs; on a pane, into the pane
+        assert_eq!(cursor(&nui).1.workspace, 0);
+        // enter on a workspace moves to its windows; on a pane, into the pane
         press(&mut nui, "\nj\n\n");
         assert!(nui.navigation.is_none());
         assert_eq!(
             nui.location(),
             Some(Location {
-                tab: 1,
+                window: 1,
                 ..Location::default()
             })
         );
@@ -282,13 +284,13 @@ mod tests {
         let mut nui = sample();
         open(&mut nui);
         let names = |nui: &Nui, at| Level::ALL.map(|level| nui.label(level, at));
-        // a session after the hovered one, then its window, named; esc keeps
-        // the automatic names of the rest
+        // a session after the hovered one, then its workspace, named; esc
+        // keeps the automatic names of the rest
         press(&mut nui, "hhhawork\ndev\n\x1b");
         assert_eq!(
             cursor(&nui),
             (
-                Level::Tab,
+                Level::Window,
                 Location {
                     session: 1,
                     ..Location::default()
@@ -297,7 +299,7 @@ mod tests {
         );
         assert_eq!(
             names(&nui, cursor(&nui).1),
-            ["work", "dev", "tab-1", "pane-1"]
+            ["work", "dev", "window-1", "pane-1"]
         );
         // no name keeps the automatic one, and goes on
         press(&mut nui, "a\n\n");
@@ -307,14 +309,14 @@ mod tests {
                 Level::Pane,
                 Location {
                     session: 1,
-                    tab: 1,
+                    window: 1,
                     ..Location::default()
                 }
             )
         );
         assert_eq!(
             names(&nui, cursor(&nui).1),
-            ["work", "dev", "tab-2", "pane-1"]
+            ["work", "dev", "window-2", "pane-1"]
         );
         assert!(nui.navigation.as_ref().unwrap().operation.is_none());
         // a session needs a name of its own
@@ -336,9 +338,9 @@ mod tests {
         press(&mut nui, "\n");
         assert_eq!(nui.sessions[0].terminals[0].status, Status::Stopped);
         press(&mut nui, "x\x1b");
-        assert_eq!(nui.sessions[0].windows[0].tabs[0].panes.len(), 2);
+        assert_eq!(nui.sessions[0].workspaces[0].windows[0].panes.len(), 2);
         press(&mut nui, "x\n");
-        assert_eq!(nui.sessions[0].windows[0].tabs[0].panes.len(), 1);
+        assert_eq!(nui.sessions[0].workspaces[0].windows[0].panes.len(), 1);
         // a session can't lose its name
         press(&mut nui, "hhhr\x7f\x7f\x7f\x7f\n");
         assert!(nui.message.is_some());

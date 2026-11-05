@@ -19,7 +19,7 @@ use crate::{
     layout::{self, Container},
     nav,
     plugin::{ClientContext, Plugins},
-    runtime::{Screen, Screens, lock},
+    runtime::{Effect, Palette, Screen, Screens, lock},
     session::SessionServer,
     state::{Fact, Level, Location, Nui, Session, Status},
     store::{Store, suffixed},
@@ -46,11 +46,28 @@ pub struct App {
     peers: HashMap<u64, Peer>,
     views: HashMap<(u64, u64), Plugins>,
     last_input: HashMap<(u64, u64), u64>,
+    /// The terminals around connected clients, as far as programs reach them.
+    outer: HashMap<u64, Outer>,
+    /// The terminals focused: in the focused pane of an instance whose
+    /// terminal has the focus, by session and terminal id.
+    focused: HashSet<(u64, u64)>,
     events: Sender<Event>,
     shell: String,
     next_session: u64,
     dirty: bool,
     pub quit: bool,
+}
+
+/// The terminal around a client, as far as programs reach it.
+#[derive(Default)]
+struct Outer {
+    /// It told it lost the focus.
+    unfocused: bool,
+    palette: Option<Palette>,
+    /// The title it shows.
+    title: Option<String>,
+    /// Bytes to pass on with the next drawing.
+    bytes: Vec<u8>,
 }
 
 struct SessionScreens<'a> {
@@ -150,6 +167,8 @@ impl App {
             peers: HashMap::new(),
             views: HashMap::new(),
             last_input: HashMap::new(),
+            outer: HashMap::new(),
+            focused: HashSet::new(),
             events,
             shell,
             next_session,
@@ -253,8 +272,100 @@ impl App {
         self.catalog.clients.retain(|client| client.id != id);
         self.views.retain(|(client, _), _| *client != id);
         self.last_input.retain(|_, client| *client != id);
+        self.outer.remove(&id);
         self.dirty = true;
         self.persist();
+    }
+
+    /// The colors of an instance's terminal answer the programs of its session.
+    fn paint(&self, client: u64) {
+        if let Some(palette) = self
+            .outer
+            .get(&client)
+            .and_then(|outer| outer.palette.as_ref())
+            && let Some(owner) = self
+                .catalog
+                .client(client)
+                .and_then(|client| self.owners.get(&client.session))
+        {
+            owner.runtime.paint(palette);
+        }
+    }
+
+    /// Pass on what the programs of a session asked of the terminal around
+    /// the person: a copy to the clipboard to the instance that typed there,
+    /// the rest to all attached to the session. A bell nobody sees marks its
+    /// terminal.
+    fn effects(&mut self, session: u64) {
+        let Some(owner) = self.owners.get(&session) else {
+            return;
+        };
+        let effects = owner.runtime.take_effects();
+        if effects.is_empty() {
+            return;
+        }
+        let viewers: Vec<u64> = self
+            .catalog
+            .clients
+            .iter()
+            .filter(|client| client.session == session)
+            .map(|client| client.id)
+            .collect();
+        let mut bell = false;
+        for (terminal, effect) in effects {
+            let (targets, bytes) = match effect {
+                Effect::Bell => {
+                    if !self.focused.contains(&(session, terminal)) {
+                        owner.runtime.ring(terminal);
+                    }
+                    bell = true;
+                    continue;
+                }
+                Effect::Copy(bytes) => {
+                    let typist = self.typist(session, terminal);
+                    (typist.map_or_else(|| viewers.clone(), |id| vec![id]), bytes)
+                }
+                Effect::Notify(bytes) => (viewers.clone(), bytes),
+            };
+            for id in targets {
+                self.outer.entry(id).or_default().bytes.extend(&bytes);
+            }
+        }
+        if bell {
+            for id in &viewers {
+                self.outer.entry(*id).or_default().bytes.push(0x07);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Tell the programs asking when their terminal gains or loses the focus.
+    fn focus(&mut self) {
+        let focused: HashSet<(u64, u64)> = self
+            .catalog
+            .clients
+            .iter()
+            .filter(|client| {
+                client.navigation.is_none()
+                    && !self
+                        .outer
+                        .get(&client.id)
+                        .is_some_and(|outer| outer.unfocused)
+            })
+            .filter_map(|client| {
+                let session = &self.owners.get(&client.session)?.state;
+                Some((client.session, session.active_terminal()?))
+            })
+            .collect();
+        for (gained, list) in [(true, &focused), (false, &self.focused)] {
+            let other = if gained { &self.focused } else { &focused };
+            for (session, terminal) in list.difference(other) {
+                if let Some(owner) = self.owners.get(session) {
+                    owner.runtime.focus(*terminal, gained);
+                }
+            }
+        }
+        self.focused = focused;
     }
 
     fn notice(&mut self, client: u64, message: impl Into<String>) {
@@ -398,6 +509,7 @@ impl App {
                 if let Some(owner) = self.owners.get(&session) {
                     owner.runtime.pending.store(false, Ordering::Release);
                 }
+                self.effects(session);
                 self.dirty = true;
                 Ok(())
             }
@@ -496,23 +608,27 @@ impl App {
                     self.dirty = true;
                     self.draw();
                 }
+                Input::FocusGained | Input::FocusLost => {
+                    self.outer.entry(id).or_default().unfocused = input == Input::FocusLost;
+                    self.dirty = true;
+                }
                 _ => {}
             },
             Request::Input(_) => return Err("attach before sending input".into()),
+            Request::Colors(palette) if self.catalog.client(id).is_some() => {
+                self.outer.entry(id).or_default().palette = Some(palette);
+                self.paint(id);
+            }
+            Request::Colors(_) => return Err("attach before telling colors".into()),
             Request::Switch {
                 session,
                 from_session,
                 terminal,
                 cwd,
             } => {
-                let client = self
-                    .last_input
-                    .get(&(from_session, terminal))
-                    .copied()
-                    .filter(|id| self.catalog.client(*id).is_some())
-                    .ok_or(
-                        "no connected instance typed into this terminal; use attach from outside",
-                    )?;
+                let client = self.typist(from_session, terminal).ok_or(
+                    "no connected instance typed into this terminal; use attach from outside",
+                )?;
                 let target = match session {
                     Some(name) => self.ensure_session(Some(&name), cwd)?,
                     None => from_session,
@@ -525,6 +641,29 @@ impl App {
                 presence.navigation = None;
                 self.reply(id, Response::Result(Ok("instance switched".into())));
                 self.dirty = true;
+            }
+            Request::Call {
+                name,
+                from_session,
+                terminal,
+            } => {
+                let client = self
+                    .typist(from_session, terminal)
+                    .ok_or("no connected instance typed into this terminal")?;
+                let (_, decoration) = self.decoration(client)?;
+                if !decoration.calls("panel", &name) {
+                    return Err(format!(
+                        "{name} is not a command of this instance; see commands in decoration"
+                    ));
+                }
+                let mut next = self.projection(Some(client));
+                if next.navigation.is_some() {
+                    nav::close(&mut next);
+                } else {
+                    nav::open(&mut next);
+                }
+                self.commit(client, next)?;
+                self.reply(id, Response::Result(Ok(String::new())));
             }
             Request::List => self.reply(id, Response::Result(Ok(self.list()))),
             Request::Reload => {
@@ -540,6 +679,7 @@ impl App {
                 self.views.clear();
                 for owner in self.owners.values_mut() {
                     owner.reload();
+                    owner.write_commands(&self.library);
                     owner.commit(owner.state.clone(), &self.library)?;
                 }
                 self.reply(id, Response::Result(Ok("decoration reloaded".into())));
@@ -562,10 +702,20 @@ impl App {
         Ok(())
     }
 
+    /// The connected instance that typed into a terminal last.
+    fn typist(&self, session: u64, terminal: u64) -> Option<u64> {
+        self.last_input
+            .get(&(session, terminal))
+            .copied()
+            .filter(|id| self.catalog.client(*id).is_some())
+    }
+
     fn input_owner(&mut self, session: u64, terminal: u64, client: u64) {
         if self.last_input.insert((session, terminal), client) != Some(client) {
-            // Fit the PTY BEFORE forwarding this client\'s first bytes. Otherwise
-            // a command such as `stty size` can race the following draw.
+            // The colors and size of the instance typing are the ones of the
+            // session. Fit the PTY BEFORE forwarding this client's first bytes:
+            // otherwise a command such as `stty size` can race the next draw.
+            self.paint(client);
             self.dirty = true;
             self.draw();
         }
@@ -638,14 +788,9 @@ impl App {
             let session = next.sessions[at.session].id;
             self.input_owner(session, terminal.id, client);
             if terminal.status == Status::Running {
-                let owner = &self.owners[&session];
-                let application_cursor = owner
-                    .runtime
-                    .screen(terminal.id)
-                    .is_some_and(|screen| lock(screen).screen().application_cursor());
-                owner
-                    .runtime
-                    .write(terminal.id, &keys::encode(&key, application_cursor));
+                let runtime = &self.owners[&session].runtime;
+                let mode = runtime.keys(terminal.id);
+                runtime.write(terminal.id, &keys::encode(&key, mode));
                 self.dirty = true;
             } else if decoration.binds("restart", &notation) {
                 next.enter(at);
@@ -799,10 +944,11 @@ impl App {
                 .is_some_and(SessionServer::poll_decoration)
             {
                 self.views.retain(|(_, session), _| *session != id);
-                if let Some(owner) = self.owners.get_mut(&id)
-                    && let Err(error) = owner.commit(owner.state.clone(), &self.library)
-                {
-                    self.broadcast(error);
+                if let Some(owner) = self.owners.get_mut(&id) {
+                    owner.write_commands(&self.library);
+                    if let Err(error) = owner.commit(owner.state.clone(), &self.library) {
+                        self.broadcast(error);
+                    }
                 }
                 self.dirty = true;
             }
@@ -813,11 +959,19 @@ impl App {
     pub fn tick(&mut self) {
         self.poll_files();
         let mut errors = Vec::new();
-        for owner in self.owners.values_mut() {
+        let mut released = Vec::new();
+        for (id, owner) in &mut self.owners {
             match owner.observe(&self.library) {
                 Ok(changed) => self.dirty |= changed,
                 Err(error) => errors.push(error),
             }
+            if owner.runtime.release() {
+                released.push(*id);
+            }
+        }
+        for session in released {
+            self.effects(session);
+            self.dirty = true;
         }
         for error in errors {
             self.broadcast(error);
@@ -831,6 +985,7 @@ impl App {
             return;
         }
         self.dirty = false;
+        self.focus();
         let clients: Vec<u64> = self
             .catalog
             .clients
@@ -915,7 +1070,14 @@ impl App {
                 self.disconnect(client);
                 continue;
             }
-            let bytes = render.take();
+            let title = self.title(&nui);
+            let outer = self.outer.entry(client).or_default();
+            let mut bytes = std::mem::take(&mut outer.bytes);
+            if let Some(title) = title.filter(|title| outer.title.as_ref() != Some(title)) {
+                bytes.extend(format!("\x1b]2;{title}\x07").into_bytes());
+                outer.title = Some(title);
+            }
+            bytes.extend(render.take());
             if let Some(peer) = self.peers.get_mut(&client) {
                 peer.render = Some(render);
             }
@@ -924,6 +1086,27 @@ impl App {
             }
         }
         self.persist();
+    }
+
+    /// The title for the terminal around an instance: the one the program of
+    /// its focused pane set, or the name of the pane. None in navigation.
+    fn title(&self, nui: &Nui) -> Option<String> {
+        let at = nui.location().filter(|_| nui.navigation.is_none())?;
+        let id = nui.pane(at)?.terminal;
+        let set = self
+            .catalog
+            .sessions
+            .get(at.session)
+            .and_then(|session| self.owners.get(session)?.runtime.screen(id))
+            .and_then(|screen| lock(screen).callbacks().title.clone());
+        let title = set.unwrap_or_else(|| nui.label(Level::Pane, at));
+        Some(
+            title
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(256)
+                .collect(),
+        )
     }
 
     pub fn list(&self) -> String {
@@ -944,10 +1127,10 @@ impl App {
 
 pub fn describe(sessions: &[Session], clients: &[Client]) -> String {
     sessions.iter().map(|session| {
-        let tabs: usize = session.windows.iter().map(|window| window.tabs.len()).sum();
-        let panes: usize = session.windows.iter().flat_map(|window| &window.tabs).map(|tab| tab.panes.len()).sum();
+        let windows = session.windows().count();
+        let panes: usize = session.windows().map(|window| window.panes.len()).sum();
         let connected = clients.iter().filter(|client| client.session == session.id).count();
-        format!("{}  id: {}  windows: {}  tabs: {tabs}  panes: {panes}  terminals: {}  clients: {connected}\n", session.name, session.id, session.windows.len(), session.terminals.len())
+        format!("{}  id: {}  workspaces: {}  windows: {windows}  panes: {panes}  terminals: {}  clients: {connected}\n", session.name, session.id, session.workspaces.len(), session.terminals.len())
     }).collect()
 }
 
@@ -964,6 +1147,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let legacy = dir.join("state.kdl");
         let global = dir.join("global-state.kdl");
+        // the shape of the old application: workspaces were windows of tabs
         let original = "toggle ctrl-a\nplugin missing.lua\nsession work { terminal 1 command=\"/bin/sh\"; window { tab { pane terminal=1 } } }";
         fs::write(&legacy, original).unwrap();
         let mut old = Store::new(legacy.clone());
@@ -993,6 +1177,10 @@ mod tests {
         let session = fs::read_to_string(crate::global::session_path(&global, 1)).unwrap();
         assert!(
             !session.contains("toggle") && !session.contains("plugin") && !session.contains("pid=")
+        );
+        assert!(
+            session.contains("workspace {") && !session.contains("tab"),
+            "{session}"
         );
         let _ = fs::remove_dir_all(dir);
     }

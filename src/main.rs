@@ -9,6 +9,7 @@ mod cli;
 mod client;
 mod decoration;
 mod global;
+mod input;
 mod ipc;
 mod kdl;
 mod keys;
