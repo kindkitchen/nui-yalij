@@ -47,6 +47,7 @@ pub struct Layer {
     pub keys: BTreeMap<String, Vec<String>>,
     pub commands: BTreeMap<String, Vec<String>>,
     pub theme: BTreeMap<String, String>,
+    pub icons: Option<Icons>,
     pub plugins: Vec<String>,
 }
 
@@ -71,11 +72,47 @@ impl Default for Theme {
     }
 }
 
+/// The symbols telling items apart, a folder from a terminal: a Nerd Font's,
+/// or plain ones for a terminal whose font has none.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Icons {
+    #[default]
+    Nerd,
+    Plain,
+}
+
+impl Icons {
+    fn parse(name: &str) -> Option<Icons> {
+        match name {
+            "nerd" => Some(Icons::Nerd),
+            "plain" => Some(Icons::Plain),
+            _ => None,
+        }
+    }
+
+    pub fn folder(self) -> &'static str {
+        match self {
+            // nf-fa-folder
+            Icons::Nerd => "\u{f07b}",
+            Icons::Plain => "▸",
+        }
+    }
+
+    pub fn terminal(self) -> &'static str {
+        match self {
+            // nf-fa-terminal
+            Icons::Nerd => "\u{f120}",
+            Icons::Plain => "$",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Decoration {
     keys: BTreeMap<String, Vec<String>>,
     commands: BTreeMap<String, Vec<String>>,
     pub theme: Theme,
+    pub icons: Icons,
     pub plugins: Vec<String>,
 }
 
@@ -98,6 +135,7 @@ impl Default for Decoration {
             keys: defaults(&ACTIONS),
             commands: defaults(&COMMANDS),
             theme: Theme::default(),
+            icons: Icons::default(),
             plugins: Vec::new(),
         }
     }
@@ -117,6 +155,9 @@ impl Decoration {
                 "error" => self.theme.error = color,
                 _ => unreachable!(),
             }
+        }
+        if let Some(icons) = layer.icons {
+            self.icons = icons;
         }
         for path in &layer.plugins {
             self.plugins.retain(|known| known != path);
@@ -197,7 +238,7 @@ impl Layer {
         let mut blocks = std::collections::HashSet::new();
         for node in doc.nodes() {
             let name = node.name().value();
-            if ["keys", "commands", "theme"].contains(&name) && !blocks.insert(name) {
+            if ["keys", "commands", "theme", "icons"].contains(&name) && !blocks.insert(name) {
                 return Err(format!("duplicate {name} block"));
             }
             match name {
@@ -225,6 +266,16 @@ impl Layer {
                         Color::from_str(color).map_err(|_| format!("{color} is not a color"))?;
                         layer.theme.insert(name.into(), color.into());
                     }
+                }
+                "icons" => {
+                    check(node, "icons", &[], &[], 1)?;
+                    let name = node
+                        .get(0)
+                        .and_then(KdlValue::as_string)
+                        .ok_or("icons take a name: nerd or plain")?;
+                    let icons = Icons::parse(name)
+                        .ok_or_else(|| format!("{name} is no icons: nerd or plain"))?;
+                    layer.icons = Some(icons);
                 }
                 "plugin" => {
                     check(node, "plugin", &[], &[], 1)?;
@@ -416,6 +467,24 @@ mod tests {
     }
 
     #[test]
+    fn icons_are_nerd_unless_plain() {
+        let layer = |text| Layer::decode(text, Path::new(".")).unwrap();
+        assert_eq!(Decoration::default().icons, Icons::Nerd);
+        // plain for every instance, but the one whose terminal has the font
+        let library = Library {
+            root: PathBuf::new(),
+            global: layer("icons plain"),
+            profiles: HashMap::from([("nerd".into(), layer("icons nerd"))]),
+        };
+        let icons = |profile| library.effective(profile, &Layer::default()).unwrap().icons;
+        assert_eq!(
+            (icons(None), icons(Some("nerd"))),
+            (Icons::Plain, Icons::Nerd)
+        );
+        assert_eq!(Icons::Plain.folder(), "▸");
+    }
+
+    #[test]
     fn brackets_switch_tabs_unless_bound_otherwise() {
         let key = |decoration: &Decoration, notation| {
             decoration.navigation_key(notation).map(|key| key.code)
@@ -482,6 +551,10 @@ mod tests {
             "commands { panel -t }",
             "commands { nope x }",
             "commands { panel t }\ncommands { panel t }",
+            "icons",
+            "icons nope",
+            "icons plain x=1",
+            "icons plain\nicons nerd",
         ] {
             assert!(Layer::decode(text, Path::new(".")).is_err(), "{text}");
         }

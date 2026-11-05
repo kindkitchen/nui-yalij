@@ -130,6 +130,7 @@ opens on `native`, at the focused pane.
   to its first terminal), enter goes into a folder or the pane of a terminal:
   the active pane of its session when that shows it, else the first. The
   folders follow shells as they `cd`; the place stays by path, not position.
+  An icon tells a folder from a terminal: see `icons` in decoration.
 
 ## State: global wrapper and independent session files
 
@@ -238,16 +239,22 @@ commands {
     panel t
 }
 theme accent=blue active=green muted=darkgray notice=yellow error=red
+icons nerd
 plugin "~/path/to/plugins/example.lua"
 ```
 
-Later layers replace individual key and command actions and theme fields; an
-action with no arguments disables it. Keys may hold `ctrl-`, `alt-`, `super-`
-and `shift-`. Command names are plain file names. Every profile's commands are
-written into a session, but a call only works for the calling instance's own;
-`reload` and live session edits rewrite them. Plugin lists accumulate, later entries take precedence,
-and duplicate paths load once. Paths are relative to **their decoration file**,
-or start with `~/`. Unknown nodes, actions, properties, keys and colors are errors.
+`icons` tell a folder from a terminal: `nerd`, the symbols of a Nerd Font, by
+default, or `plain` (`▸`, `$`) where the font has none. No terminal tells
+which, so a profile, decorating the instance in that terminal, can say it.
+
+Later layers replace individual key and command actions, theme fields and
+icons; an action with no arguments disables it. Keys may hold `ctrl-`,
+`alt-`, `super-` and `shift-`. Command names are plain file names. Every
+profile's commands are written into a session, but a call only works for the
+calling instance's own; `reload` and live session edits rewrite them. Plugin
+lists accumulate, later entries take precedence, and duplicate paths load
+once. Paths are relative to **their decoration file**, or start with `~/`.
+Unknown nodes, actions, properties, keys and colors are errors.
 
 A profile decorates its instance; it cannot impose active windows, layout names or
 other session state. Attaching/reloading a profile never runs its automatic

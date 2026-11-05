@@ -99,7 +99,7 @@ pub fn navigation(
             }
             rules(buffer, &columns, theme);
         }
-        StateRepresentation::Fs => fs(buffer, nui, runtime, navigation, sections, theme),
+        StateRepresentation::Fs => fs(buffer, nui, runtime, navigation, sections, decoration),
     }
     // the first line of a message: the rest, such as a traceback, stays in the state
     let (text, color) = match nui
@@ -231,8 +231,9 @@ fn fs(
     runtime: &impl Screens,
     navigation: &Navigation,
     area: Rect,
-    theme: &Theme,
+    decoration: &Decoration,
 ) {
+    let theme = &decoration.theme;
     let columns = Layout::horizontal([Constraint::Fill(1); 3])
         .spacing(1)
         .split(area);
@@ -247,7 +248,7 @@ fn fs(
         let path = tree.title(node, home);
         Span::raw(format!(" {}", tail(&path, area.width.saturating_sub(1))))
     };
-    let line = |node: usize| fs_item(nui, runtime, tree, node, home, theme);
+    let line = |node: usize| fs_item(nui, runtime, tree, node, home, decoration);
     let marked = |list: &[usize], node: Option<usize>, style: Style| {
         let index = list.iter().position(|child| Some(*child) == node);
         index.map(|index| (index, style))
@@ -373,21 +374,23 @@ fn item(
     Line::from(spans)
 }
 
-/// An item of the fs representation: a folder, with what its terminals
-/// tell; or a terminal by its pane, with a dot when its session shows it,
-/// and the session when there are more.
+/// An item of the fs representation, by an icon of its kind: a folder, with
+/// what its terminals tell; or a terminal by its pane, with a dot when its
+/// session shows it, and the session when there are more.
 fn fs_item(
     nui: &Nui,
     runtime: &impl Screens,
     tree: &Tree,
     node: usize,
     home: Option<&Path>,
-    theme: &Theme,
+    decoration: &Decoration,
 ) -> Line<'static> {
+    let (theme, icons) = (&decoration.theme, decoration.icons);
     let Item::Terminal(at) = tree.item(node) else {
+        let icon = Span::raw(icons.folder()).fg(theme.accent);
         let name = format!("{}/", tree.name(node, home).trim_end_matches('/'));
         let inside = tree.terminals(nui, node);
-        let mut spans = vec!["   ".into(), name.into()];
+        let mut spans = vec!["   ".into(), icon, " ".into(), name.into()];
         spans.extend(marks(nui, runtime, &inside, false, theme));
         return Line::from(spans);
     };
@@ -398,8 +401,8 @@ fn fs_item(
     } else {
         Span::raw(" ")
     };
-    let label = nui.label(Level::Pane, *at);
-    let mut spans = vec![" ".into(), dot, " ".into(), label.into()];
+    let label = format!(" {} {}", icons.terminal(), nui.label(Level::Pane, *at));
+    let mut spans = vec![" ".into(), dot, label.into()];
     if nui.sessions.len() > 1 {
         spans.push(Span::styled(format!(" · {}", session.name), theme.muted));
     }
@@ -795,18 +798,19 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+    use crate::decoration::Icons;
     use crate::folders::tests::foldered;
     use crate::runtime::Runtime;
     use crate::state::tests::sample;
 
     /// The panel drawn, and its rows as text.
-    fn draw(nui: &Nui, width: u16, height: u16) -> (Buffer, Vec<String>) {
+    fn draw(nui: &Nui, decoration: &Decoration, width: u16, height: u16) -> (Buffer, Vec<String>) {
         let (events, _) = std::sync::mpsc::channel();
         let runtime = Runtime::new(events, (24, 80));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| {
-                navigation(frame, nui, &runtime, &Decoration::default(), &mut |_, c| {
+                navigation(frame, nui, &runtime, decoration, &mut |_, c| {
                     layout::tabs(c)
                 })
             })
@@ -878,7 +882,7 @@ mod tests {
             folder: None,
             operation: None,
         });
-        let (buffer, rows) = draw(&nui, 120, 20);
+        let (buffer, rows) = draw(&nui, &Decoration::default(), 120, 20);
         assert!(
             rows[0].contains(" native ") && rows[0].contains(" fs "),
             "{}",
@@ -892,13 +896,24 @@ mod tests {
                 && titles.contains(" panes"),
             "{titles}"
         );
-        for (row, texts) in [
-            (2, ["web/src/", "● sh · main", "main › sh › sh › sh"]),
-            (3, ["yalij/", "● sh · other", "main › sh › sh › sh"]),
-        ] {
-            for text in texts {
-                assert!(rows[row].contains(text), "{text}: {}", rows[row]);
+        // folders and terminals by their icons, of a Nerd Font or plain
+        for icons in [Icons::Nerd, Icons::Plain] {
+            let mut decoration = Decoration::default();
+            decoration.icons = icons;
+            let (_, rows) = draw(&nui, &decoration, 120, 20);
+            let (folder, terminal) = (icons.folder(), icons.terminal());
+            let expected = [
+                (2, format!("{folder} web/src/")),
+                (2, format!("● {terminal} sh · main")),
+                (3, format!("{folder} yalij/")),
+                (3, format!("● {terminal} sh · other")),
+            ];
+            for (row, text) in expected {
+                assert!(rows[row].contains(&text), "{text}: {}", rows[row]);
             }
+        }
+        for row in [2, 3] {
+            assert!(rows[row].contains("main › sh › sh › sh"), "{}", rows[row]);
         }
         // only to move in: no operations among the keys
         assert!(
