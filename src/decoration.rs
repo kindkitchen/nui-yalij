@@ -19,12 +19,14 @@ use crate::{
     keys,
 };
 
-const ACTIONS: [(&str, &[&str]); 14] = [
+const ACTIONS: [(&str, &[&str]); 16] = [
     ("panel", &["ctrl-g"]),
     ("left", &["h", "left"]),
     ("right", &["l", "right"]),
     ("next", &["j", "down"]),
     ("previous", &["k", "up"]),
+    ("previous-tab", &["["]),
+    ("next-tab", &["]"]),
     ("add", &["a"]),
     ("rename", &["r"]),
     ("remove", &["x"]),
@@ -157,6 +159,8 @@ impl Decoration {
             "right" => KeyCode::Right,
             "next" => KeyCode::Down,
             "previous" => KeyCode::Up,
+            "previous-tab" => KeyCode::Char('['),
+            "next-tab" => KeyCode::Char(']'),
             "add" => KeyCode::Char('a'),
             "rename" => KeyCode::Char('r'),
             "remove" => KeyCode::Char('x'),
@@ -409,6 +413,29 @@ mod tests {
             ["/config/global.lua", "/config/session.lua"]
         );
         assert!(library.effective(Some("missing"), &session).is_err());
+    }
+
+    #[test]
+    fn brackets_switch_tabs_unless_bound_otherwise() {
+        let key = |decoration: &Decoration, notation| {
+            decoration.navigation_key(notation).map(|key| key.code)
+        };
+        let plain = Decoration::default();
+        assert_eq!(key(&plain, "["), Some(KeyCode::Char('[')));
+        assert_eq!(key(&plain, "]"), Some(KeyCode::Char(']')));
+        let library = Library {
+            root: PathBuf::new(),
+            global: Layer::decode(
+                "keys { previous-tab \"<\"; next-tab \">\" }",
+                Path::new("."),
+            )
+            .unwrap(),
+            profiles: HashMap::new(),
+        };
+        let bound = library.effective(None, &Layer::default()).unwrap();
+        assert_eq!(key(&bound, ">"), Some(KeyCode::Char(']')));
+        assert_eq!(key(&bound, "]"), None);
+        assert_eq!(bound.hint("previous-tab"), "<");
     }
 
     #[test]

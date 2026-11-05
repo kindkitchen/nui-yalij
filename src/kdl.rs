@@ -18,14 +18,15 @@
 //! ```
 //!
 //! Indices count from 1. Defaults are left out when writing: `layout="tabs"`,
-//! `active=1`, `status="running"`. The older shape, sessions of `window`s of
-//! `tab`s, still reads: the same levels under their former names.
+//! `active=1`, `status="running"`, `representation="native"`. The older
+//! shape, sessions of `window`s of `tab`s, still reads: the same levels under
+//! their former names.
 
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use crate::state::{
-    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session, Status, Terminal,
-    Window, Workspace,
+    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session,
+    StateRepresentation, Status, Terminal, Window, Workspace,
 };
 
 const HEADER: &str = "// nui-yalij state: the single source of truth, applied live when changed.\n";
@@ -113,10 +114,15 @@ fn terminal(terminal: &Terminal) -> KdlNode {
 
 pub(crate) fn navigation(navigation: &Navigation) -> KdlNode {
     let cursor = navigation.cursor;
-    let mut node = node("navigation").prop("focus", navigation.focus.name());
+    let mut node = node("navigation");
+    if navigation.representation != StateRepresentation::Native {
+        node = node.prop("representation", navigation.representation.name());
+    }
+    node = node.prop("focus", navigation.focus.name());
     for level in Level::ALL {
         node = node.prop(level.name(), index(cursor.get(level)));
     }
+    node = node.option("folder", navigation.folder.as_deref());
     match &navigation.operation {
         Some(Operation::Rename { input }) => {
             node = node.child(self::node("rename").arg(input.as_str()).0)
@@ -402,8 +408,22 @@ impl<'a> Decoder<'a> {
     fn navigation(&self, node: &KdlNode) -> Result<Navigation, String> {
         let entries = self.read(
             node,
-            &["focus", "session", "workspace", "window", "tab", "pane"],
+            &[
+                "representation",
+                "focus",
+                "session",
+                "workspace",
+                "window",
+                "tab",
+                "pane",
+                "folder",
+            ],
         )?;
+        let representation = match entries.string("representation")? {
+            None => StateRepresentation::Native,
+            Some(name) => StateRepresentation::parse(&name)
+                .ok_or_else(|| self.error(node, &format!("unknown representation {name}")))?,
+        };
         let focus = entries.string("focus")?.unwrap_or_else(|| "pane".into());
         // the older shape named workspaces `window` and windows `tab`
         let older = node.get("tab").is_some() || focus == "tab";
@@ -435,8 +455,10 @@ impl<'a> Decoder<'a> {
             });
         }
         Ok(Navigation {
+            representation,
             focus,
             cursor,
+            folder: entries.string("folder")?,
             operation,
         })
     }
@@ -532,6 +554,7 @@ mod tests {
         terminal.title = Some("a \"quoted\" title".into());
         nui.sessions[0].workspaces[0].windows[0].panes[0].name = Some("logs".into());
         nui.navigation = Some(Navigation {
+            representation: StateRepresentation::Native,
             focus: Level::Window,
             cursor: Location {
                 session: 0,
@@ -539,17 +562,28 @@ mod tests {
                 window: 1,
                 pane: 0,
             },
+            folder: None,
             operation: Some(Operation::Rename {
                 input: "draft".into(),
             }),
         });
         nui.message = Some("hello".into());
         let text = encode(&nui);
+        assert!(!text.contains("representation"), "{text}");
         assert_eq!(decode(&text).unwrap(), nui, "{text}");
-        nui.navigation.as_mut().unwrap().operation = Some(Operation::Create {
+        let navigation = nui.navigation.as_mut().unwrap();
+        navigation.operation = Some(Operation::Create {
             input: String::new(),
         });
         assert_eq!(decode(&encode(&nui)).unwrap(), nui);
+        let navigation = nui.navigation.as_mut().unwrap();
+        navigation.representation = StateRepresentation::Fs;
+        navigation.folder = Some("/home/me/a \"b\"".into());
+        navigation.operation = None;
+        let text = encode(&nui);
+        assert!(text.contains("representation=fs"), "{text}");
+        assert_eq!(decode(&text).unwrap(), nui, "{text}");
+        assert!(decode("navigation representation=tree").is_err());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::{
     plugin::{ClientContext, Plugins},
     runtime::{Effect, Palette, Screen, Screens, lock},
     session::SessionServer,
-    state::{Fact, Level, Location, Nui, Session, Status},
+    state::{Fact, Level, Location, Nui, Session, StateRepresentation, Status},
     store::{Store, suffixed},
     ui,
 };
@@ -735,11 +735,10 @@ impl App {
             }
             return self.commit(client, next);
         }
-        if next
-            .navigation
-            .as_ref()
-            .is_none_or(|nav| nav.operation.is_none())
-        {
+        // plugin keys of navigation act on the native representation
+        if next.navigation.as_ref().is_none_or(|nav| {
+            nav.operation.is_none() && nav.representation == StateRepresentation::Native
+        }) {
             let plugins = self
                 .views
                 .entry((client, session))

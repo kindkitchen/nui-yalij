@@ -1,6 +1,6 @@
 //! Drawing: shared session state and client presence, styled by decoration.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, path::Path};
 
 use ratatui::{
     Frame,
@@ -12,22 +12,34 @@ use ratatui::{
 };
 
 use crate::decoration::{Decoration, Theme};
+use crate::folders::{self, Item, Tree, View};
 use crate::layout::{self, Container, Draw, Placement, Scene, Shown};
 use crate::runtime::{Screens, lock};
-use crate::state::{Level, Location, Navigation, Nui, Operation, Status, Terminal};
+use crate::state::{
+    Level, Location, Navigation, Nui, Operation, StateRepresentation, Status, Terminal,
+};
 
-fn hints(d: &Decoration) -> String {
+/// The keys of a representation: the fs one is only moved in.
+fn hints(d: &Decoration, representation: StateRepresentation) -> String {
+    let operations = match representation {
+        StateRepresentation::Native => format!(
+            "  {} add  {} rename  {} remove  {} stop",
+            d.hint("add"),
+            d.hint("rename"),
+            d.hint("remove"),
+            d.hint("stop")
+        ),
+        StateRepresentation::Fs => String::new(),
+    };
     format!(
-        "{}{}{}{} move  {} go  {} add  {} rename  {} remove  {} stop  {} back  {} detach  {} shutdown",
+        "{}{}{}{} move  {} go  {}{} tabs{operations}  {} back  {} detach  {} shutdown",
         d.hint("left"),
         d.hint("next"),
         d.hint("previous"),
         d.hint("right"),
         d.hint("enter"),
-        d.hint("add"),
-        d.hint("rename"),
-        d.hint("remove"),
-        d.hint("stop"),
+        d.hint("previous-tab"),
+        d.hint("next-tab"),
         d.hint("back"),
         d.hint("detach"),
         d.hint("quit")
@@ -54,7 +66,8 @@ pub fn view(
     draws(frame.buffer_mut(), &scene.draws);
 }
 
-/// The navigation panel: the sections over the preview of the hovered item.
+/// The navigation panel: the tabs of the representations of the state, and
+/// the sections of the shown one over the preview of what it points to.
 pub fn navigation(
     frame: &mut Frame,
     nui: &Nui,
@@ -67,51 +80,39 @@ pub fn navigation(
     };
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(frame.area());
-    let [sections, status] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(top);
+    let [bar, sections, status] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(top);
     let columns = Layout::horizontal([Constraint::Fill(1); 4])
         .spacing(1)
         .split(sections);
     let buffer = frame.buffer_mut();
-    for (level, column) in Level::ALL.into_iter().zip(columns.iter()) {
-        section(
-            buffer,
-            nui,
-            runtime,
-            navigation,
-            level,
-            *column,
-            &decoration.theme,
-        );
-    }
-    for column in columns.iter().skip(1) {
-        for y in column.top()..column.bottom() {
-            buffer[(column.x - 1, y)]
-                .set_symbol("│")
-                .set_fg(decoration.theme.muted);
+    let theme = &decoration.theme;
+    tabs(buffer, bar, navigation.representation, theme);
+    match navigation.representation {
+        StateRepresentation::Native => {
+            for (level, column) in Level::ALL.into_iter().zip(columns.iter()) {
+                section(buffer, nui, runtime, navigation, level, *column, theme);
+            }
+            rules(buffer, &columns, theme);
         }
+        StateRepresentation::Fs => fs(buffer, nui, runtime, navigation, sections, theme),
     }
     // the first line of a message: the rest, such as a traceback, stays in the state
-    match nui
+    let (text, color) = match nui
         .message
         .as_deref()
         .and_then(|message| message.lines().next())
     {
-        Some(message) => buffer.set_stringn(
-            status.x + 1,
-            status.y,
-            message,
-            status.width as usize,
-            decoration.theme.notice,
-        ),
-        None => buffer.set_stringn(
-            status.x + 1,
-            status.y,
-            hints(decoration),
-            status.width as usize,
-            decoration.theme.muted,
-        ),
+        Some(message) => (message.to_string(), theme.notice),
+        None => (hints(decoration, navigation.representation), theme.muted),
     };
+    if !status.is_empty() {
+        buffer.set_stringn(status.x + 1, status.y, text, status.width as usize, color);
+    }
     preview(buffer, nui, runtime, navigation, bottom, decoration, place);
     let column = columns[navigation.focus as usize];
     match &navigation.operation {
@@ -141,6 +142,46 @@ pub fn navigation(
     }
 }
 
+/// The top border: a tab for each representation of the state, the shown
+/// one marked.
+fn tabs(buffer: &mut Buffer, area: Rect, shown: StateRepresentation, theme: &Theme) {
+    if area.is_empty() {
+        return;
+    }
+    buffer.set_string(
+        area.x,
+        area.y,
+        "─".repeat(area.width as usize),
+        Style::new().fg(theme.muted),
+    );
+    let mut x = area.x + 1;
+    for representation in StateRepresentation::ALL {
+        let style = if representation == shown {
+            Style::new().fg(theme.accent).bold().reversed()
+        } else {
+            Style::new().fg(theme.muted)
+        };
+        let name = format!(" {} ", representation.name());
+        let room = area.right().saturating_sub(x) as usize;
+        x = buffer
+            .set_stringn(x, area.y, name, room, style)
+            .0
+            .saturating_add(1);
+    }
+}
+
+/// The rules between sections.
+fn rules(buffer: &mut Buffer, columns: &[Rect], theme: &Theme) {
+    for column in columns.iter().skip(1).filter(|column| column.x > 0) {
+        for y in column.top()..column.bottom() {
+            let position = Position::new(column.x - 1, y);
+            if buffer.area.contains(position) {
+                buffer[position].set_symbol("│").set_fg(theme.muted);
+            }
+        }
+    }
+}
+
 /// A section: the title of its level and its items, the hovered one marked
 /// as yazi does: reversed in the focused section and the ones left of it,
 /// underlined in the ones right of it.
@@ -159,50 +200,143 @@ fn section(
         Level::Window => " windows",
         Level::Pane => " panes",
     };
-    let title_style = if level == navigation.focus {
-        Style::new().fg(theme.accent).bold()
+    let title = if level == navigation.focus {
+        Span::raw(title).fg(theme.accent).bold()
     } else {
-        Style::new().fg(theme.muted)
-    };
-    buffer.set_stringn(area.x, area.y, title, area.width as usize, title_style);
-    let list = Rect {
-        y: area.y + 1,
-        height: area.height.saturating_sub(1),
-        ..area
+        Span::raw(title).fg(theme.muted)
     };
     let hovered = navigation.cursor.get(level);
-    let first = scroll(hovered, list.height);
-    for (row, index) in (first..nui.count(level, navigation.cursor))
-        .enumerate()
-        .take(list.height as usize)
-    {
+    let style = match level.cmp(&navigation.focus) {
+        Ordering::Equal => Style::new().reversed().bold(),
+        Ordering::Less => Style::new().reversed(),
+        Ordering::Greater => Style::new().underlined(),
+    };
+    let (count, marked) = (nui.count(level, navigation.cursor), Some((hovered, style)));
+    listing(buffer, area, title, count, marked, |index| {
         let at = if index == hovered {
             navigation.cursor
         } else {
             nui.descend(level, navigation.cursor.with(level, index))
         };
+        item(nui, runtime, level, at, index, theme)
+    });
+}
+
+/// The sections of the fs representation: the list the person came from,
+/// the folder they are in, and where its hovered item leads; the items on
+/// the way to the terminal pointed at marked as in the native one.
+fn fs(
+    buffer: &mut Buffer,
+    nui: &Nui,
+    runtime: &impl Screens,
+    navigation: &Navigation,
+    area: Rect,
+    theme: &Theme,
+) {
+    let columns = Layout::horizontal([Constraint::Fill(1); 3])
+        .spacing(1)
+        .split(area);
+    rules(buffer, &columns, theme);
+    let Some(view) = View::new(nui, navigation) else {
+        return;
+    };
+    let (tree, home) = (&view.tree, folders::home());
+    let home = home.as_deref();
+    // the path of a folder; its end, in a narrow section
+    let heading = |node: usize, area: Rect| {
+        let path = tree.title(node, home);
+        Span::raw(format!(" {}", tail(&path, area.width.saturating_sub(1))))
+    };
+    let line = |node: usize| fs_item(nui, runtime, tree, node, home, theme);
+    let marked = |list: &[usize], node: Option<usize>, style: Style| {
+        let index = list.iter().position(|child| Some(*child) == node);
+        index.map(|index| (index, style))
+    };
+    let center = view.center();
+    if let Some(parent) = tree.parent(center) {
+        let list = tree.children(parent);
+        let title = heading(parent, columns[0]).fg(theme.muted);
+        let hovered = marked(list, Some(center), Style::new().reversed());
+        listing(buffer, columns[0], title, list.len(), hovered, |index| {
+            line(list[index])
+        });
+    }
+    let list = tree.children(center);
+    let title = heading(center, columns[1]).fg(theme.accent).bold();
+    let hovered = marked(list, Some(view.node()), Style::new().reversed().bold());
+    listing(buffer, columns[1], title, list.len(), hovered, |index| {
+        line(list[index])
+    });
+    match tree.item(view.node()) {
+        Item::Folder(_) => {
+            let list = tree.children(view.node());
+            let title = heading(view.node(), columns[2]).fg(theme.muted);
+            let hovered = marked(list, view.next(), Style::new().underlined());
+            listing(buffer, columns[2], title, list.len(), hovered, |index| {
+                line(list[index])
+            });
+        }
+        Item::Terminal(at) => {
+            let panes = folders::panes(nui, *at);
+            let title = Span::raw(" panes").fg(theme.muted);
+            let hovered = panes
+                .iter()
+                .position(|pane| *pane == navigation.cursor)
+                .map(|index| (index, Style::new().underlined()));
+            listing(buffer, columns[2], title, panes.len(), hovered, |index| {
+                levels(nui, panes[index], theme)
+            });
+        }
+    }
+}
+
+/// A list under its title, the hovered item marked and kept in sight.
+fn listing(
+    buffer: &mut Buffer,
+    area: Rect,
+    title: Span,
+    count: usize,
+    hovered: Option<(usize, Style)>,
+    item: impl Fn(usize) -> Line<'static>,
+) {
+    if area.is_empty() {
+        return;
+    }
+    buffer.set_span(area.x, area.y, &title, area.width);
+    let list = Rect {
+        y: area.y + 1,
+        height: area.height - 1,
+        ..area
+    };
+    let first = hovered.map_or(0, |(index, _)| scroll(index, list.height));
+    for (row, index) in (first..count).enumerate().take(list.height as usize) {
         let line = Rect {
             y: list.y + row as u16,
             height: 1,
             ..list
         };
-        if index == hovered {
-            buffer.set_style(
-                line,
-                match level.cmp(&navigation.focus) {
-                    Ordering::Equal => Style::new().reversed().bold(),
-                    Ordering::Less => Style::new().reversed(),
-                    Ordering::Greater => Style::new().underlined(),
-                },
-            );
+        if let Some((_, style)) = hovered.filter(|(hovered, _)| *hovered == index) {
+            buffer.set_style(line, style);
         }
-        buffer.set_line(
-            line.x,
-            line.y,
-            &item(nui, runtime, level, at, index, theme),
-            line.width,
-        );
+        buffer.set_line(line.x, line.y, &item(index), line.width);
     }
+}
+
+/// The end of `text` in `width` cells, its start given to an ellipsis: the
+/// end tells paths apart.
+fn tail(text: &str, width: u16) -> String {
+    let width = width as usize;
+    if Line::raw(text).width() <= width {
+        return text.into();
+    }
+    let mut start = text.len();
+    for (index, _) in text.char_indices().rev() {
+        if Line::raw(&text[index..]).width() >= width {
+            break;
+        }
+        start = index;
+    }
+    format!("…{}", &text[start..])
 }
 
 /// The first item shown, so the hovered one stays in a list of `height`.
@@ -230,45 +364,107 @@ fn item(
         _ => format!("{} {}", index + 1, nui.label(level, at)),
     };
     let mut spans = vec![" ".into(), dot, " ".into(), label.into()];
-    let inside = match nui.shown(at).filter(|_| level == Level::Pane) {
-        Some(terminal) if terminal.status != Status::Running => {
-            let (text, color) = status(terminal, theme);
-            spans.push(Span::styled(format!(" {text}"), color));
-            return Line::from(spans);
-        }
-        Some(terminal) => vec![terminal.id],
-        None => nui.terminals_in(level, at),
+    let inside: Vec<(usize, u64)> = nui
+        .terminals_in(level, at)
+        .into_iter()
+        .map(|id| (at.session, id))
+        .collect();
+    spans.extend(marks(nui, runtime, &inside, level == Level::Pane, theme));
+    Line::from(spans)
+}
+
+/// An item of the fs representation: a folder, with what its terminals
+/// tell; or a terminal by its pane, with a dot when its session shows it,
+/// and the session when there are more.
+fn fs_item(
+    nui: &Nui,
+    runtime: &impl Screens,
+    tree: &Tree,
+    node: usize,
+    home: Option<&Path>,
+    theme: &Theme,
+) -> Line<'static> {
+    let Item::Terminal(at) = tree.item(node) else {
+        let name = format!("{}/", tree.name(node, home).trim_end_matches('/'));
+        let inside = tree.terminals(nui, node);
+        let mut spans = vec!["   ".into(), name.into()];
+        spans.extend(marks(nui, runtime, &inside, false, theme));
+        return Line::from(spans);
     };
     let session = &nui.sessions[at.session];
-    let running: Vec<u64> = inside
+    let id = nui.pane(*at).map_or(0, |pane| pane.terminal);
+    let dot = if session.active_terminal() == Some(id) {
+        Span::raw("●").fg(theme.active)
+    } else {
+        Span::raw(" ")
+    };
+    let label = nui.label(Level::Pane, *at);
+    let mut spans = vec![" ".into(), dot, " ".into(), label.into()];
+    if nui.sessions.len() > 1 {
+        spans.push(Span::styled(format!(" · {}", session.name), theme.muted));
+    }
+    spans.extend(marks(nui, runtime, &[(at.session, id)], true, theme));
+    Line::from(spans)
+}
+
+/// Where a pane is: the names of its levels, with a dot when its session
+/// shows it.
+fn levels(nui: &Nui, at: Location, theme: &Theme) -> Line<'static> {
+    let dot = if nui.active_location(at.session) == Some(at) {
+        Span::raw("●").fg(theme.active)
+    } else {
+        Span::raw(" ")
+    };
+    let names = Level::ALL.map(|level| nui.label(level, at)).join(" › ");
+    Line::from(vec![" ".into(), dot, " ".into(), names.into()])
+}
+
+/// What the terminals inside an item tell, by session and id: how the one of
+/// a pane ended, when it doesn't run; that all are stopped, when none runs;
+/// and what the programs running call attention to.
+fn marks(
+    nui: &Nui,
+    runtime: &impl Screens,
+    inside: &[(usize, u64)],
+    pane: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let terminal = |(session, id): (usize, u64)| nui.sessions.get(session)?.terminal(id);
+    if pane
+        && let [one] = inside
+        && let Some(terminal) = terminal(*one).filter(|terminal| terminal.status != Status::Running)
+    {
+        let (text, color) = status(terminal, theme);
+        return vec![Span::styled(format!(" {text}"), color)];
+    }
+    let running: Vec<(usize, u64)> = inside
         .iter()
         .copied()
-        .filter(|id| {
-            session
-                .terminal(*id)
-                .is_some_and(|terminal| terminal.status == Status::Running)
+        .filter(|inside| {
+            terminal(*inside).is_some_and(|terminal| terminal.status == Status::Running)
         })
         .collect();
+    let mut spans = Vec::new();
     if !inside.is_empty() && running.is_empty() {
         spans.push(Span::styled(" stopped", theme.notice));
     }
-    let (progress, bell) = attention(runtime, at.session, &running);
+    let (progress, bell) = attention(runtime, &running);
     if let Some(progress) = progress {
         spans.push(Span::styled(format!(" {progress}"), theme.accent));
     }
     if bell {
         spans.push(Span::styled(" bell", theme.notice));
     }
-    Line::from(spans)
+    spans
 }
 
-/// What the programs of terminals call attention to: their progress in a
-/// word, and whether a bell rang that nobody saw.
-fn attention(runtime: &impl Screens, session: usize, terminals: &[u64]) -> (Option<String>, bool) {
+/// What the programs of terminals, by session and id, call attention to:
+/// their progress in a word, and whether a bell rang that nobody saw.
+fn attention(runtime: &impl Screens, terminals: &[(usize, u64)]) -> (Option<String>, bool) {
     let mut progress: Option<String> = None;
     let mut bell = false;
-    for id in terminals {
-        let Some(screen) = runtime.screen_at(session, *id) else {
+    for (session, id) in terminals {
+        let Some(screen) = runtime.screen_at(*session, *id) else {
             continue;
         };
         let parser = lock(screen);
@@ -289,8 +485,9 @@ fn attention(runtime: &impl Screens, session: usize, terminals: &[u64]) -> (Opti
     (progress, bell)
 }
 
-/// The bottom half: the hovered item as the view would show it, under a rule
-/// naming it.
+/// The bottom half: what the representation points to as the view would
+/// show it, under a rule naming it: the hovered item of a native section, or
+/// the terminal of fs.
 fn preview(
     buffer: &mut Buffer,
     nui: &Nui,
@@ -309,11 +506,17 @@ fn preview(
         "─".repeat(area.width as usize),
         Style::new().fg(decoration.theme.muted),
     );
-    let name = format!(
-        " {} {} ",
-        navigation.focus.name(),
-        nui.label(navigation.focus, navigation.cursor)
-    );
+    let (level, name) = match navigation.representation {
+        StateRepresentation::Native => (
+            navigation.focus,
+            format!(
+                " {} {} ",
+                navigation.focus.name(),
+                nui.label(navigation.focus, navigation.cursor)
+            ),
+        ),
+        StateRepresentation::Fs => (Level::Pane, pointed(nui, navigation.cursor)),
+    };
     buffer.set_stringn(
         area.x + 1,
         area.y,
@@ -326,11 +529,25 @@ fn preview(
         height: area.height - 1,
         ..area
     };
-    let scene = layout::scene(nui, navigation.focus, navigation.cursor, inner, place);
+    let scene = layout::scene(nui, level, navigation.cursor, inner, place);
     for shown in &scene.panes {
         pane(buffer, nui, runtime, shown, false, decoration);
     }
     draws(buffer, &scene.draws);
+}
+
+/// What the fs representation points to: a terminal by its pane, and where
+/// it runs.
+fn pointed(nui: &Nui, at: Location) -> String {
+    let label = nui.label(Level::Pane, at);
+    match nui.shown(at).and_then(|terminal| terminal.cwd.as_deref()) {
+        Some(cwd) => {
+            let home = folders::home();
+            let cwd = folders::tilde(Path::new(cwd), home.as_deref());
+            format!(" terminal {label} in {cwd} ")
+        }
+        None => format!(" terminal {label} "),
+    }
 }
 
 /// The input of a name, under the hovered item as in yazi.
@@ -578,8 +795,28 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::*;
+    use crate::folders::tests::foldered;
     use crate::runtime::Runtime;
     use crate::state::tests::sample;
+
+    /// The panel drawn, and its rows as text.
+    fn draw(nui: &Nui, width: u16, height: u16) -> (Buffer, Vec<String>) {
+        let (events, _) = std::sync::mpsc::channel();
+        let runtime = Runtime::new(events, (24, 80));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                navigation(frame, nui, &runtime, &Decoration::default(), &mut |_, c| {
+                    layout::tabs(c)
+                })
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect();
+        (buffer, rows)
+    }
 
     #[test]
     fn draws_at_any_size() {
@@ -596,30 +833,97 @@ mod tests {
             Some(Operation::Remove),
             Some(Operation::Stop),
         ];
-        for (width, height) in [(1, 1), (10, 3), (40, 2), (30, 8), (200, 60)] {
+        let shown = [
+            (StateRepresentation::Native, None),
+            (StateRepresentation::Fs, None),
+            (StateRepresentation::Fs, Some("/home/me/nui")),
+        ];
+        for (width, height) in [(1, 1), (20, 1), (10, 3), (40, 2), (30, 8), (200, 60)] {
             for operation in operations.clone() {
                 for focus in Level::ALL {
-                    let mut nui = sample();
-                    nui.navigation = Some(Navigation {
-                        focus,
-                        cursor: Location::default(),
-                        operation: operation.clone(),
-                    });
-                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-                    terminal
-                        .draw(|frame| {
-                            navigation(
-                                frame,
-                                &nui,
-                                &runtime,
-                                &Decoration::default(),
-                                &mut |_, c| layout::tabs(c),
-                            )
-                        })
-                        .unwrap();
+                    for (representation, folder) in shown {
+                        let mut nui = foldered();
+                        nui.navigation = Some(Navigation {
+                            representation,
+                            focus,
+                            cursor: Location::default(),
+                            folder: folder.map(Into::into),
+                            operation: operation.clone(),
+                        });
+                        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                navigation(
+                                    frame,
+                                    &nui,
+                                    &runtime,
+                                    &Decoration::default(),
+                                    &mut |_, c| layout::tabs(c),
+                                )
+                            })
+                            .unwrap();
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn fs_shows_where_the_person_came_from_is_and_goes() {
+        let mut nui = foldered();
+        nui.navigation = Some(Navigation {
+            representation: StateRepresentation::Fs,
+            focus: Level::Pane,
+            cursor: Location::default(),
+            folder: None,
+            operation: None,
+        });
+        let (buffer, rows) = draw(&nui, 120, 20);
+        assert!(
+            rows[0].contains(" native ") && rows[0].contains(" fs "),
+            "{}",
+            rows[0]
+        );
+        // from the folder above, in the folder of the terminal, to its panes
+        let titles = &rows[1];
+        assert!(
+            titles.contains(" /home/me/nui ")
+                && titles.contains(" /home/me/nui/yalij ")
+                && titles.contains(" panes"),
+            "{titles}"
+        );
+        for (row, texts) in [
+            (2, ["web/src/", "● sh · main", "main › sh › sh › sh"]),
+            (3, ["yalij/", "● sh · other", "main › sh › sh › sh"]),
+        ] {
+            for text in texts {
+                assert!(rows[row].contains(text), "{text}: {}", rows[row]);
+            }
+        }
+        // only to move in: no operations among the keys
+        assert!(
+            rows[9].contains("[] tabs") && !rows[9].contains("rename"),
+            "{}",
+            rows[9]
+        );
+        assert!(
+            rows[10].contains(" terminal sh in /home/me/nui/yalij "),
+            "{}",
+            rows[10]
+        );
+        // marked: the terminal hovered, the folder it is in, the pane it goes to
+        let style = |y: usize, text: &str| {
+            let x = rows[y].chars().count() - rows[y].split_once(text).unwrap().1.chars().count();
+            buffer[((x - text.chars().count()) as u16, y as u16)].modifier
+        };
+        assert!(style(2, "sh · main").contains(Modifier::REVERSED | Modifier::BOLD));
+        assert!(style(3, "yalij/").contains(Modifier::REVERSED));
+        assert!(!style(2, "web/src/").contains(Modifier::REVERSED));
+        assert!(style(2, "main ›").contains(Modifier::UNDERLINED));
+        assert!(!style(3, "main ›").contains(Modifier::UNDERLINED));
+        // a long path keeps its end
+        assert_eq!(tail("/home/me/nui/yalij", 8), "…i/yalij");
+        assert_eq!(tail("/home", 8), "/home");
     }
 
     #[test]

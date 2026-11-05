@@ -350,6 +350,53 @@ fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
 }
 
 #[test]
+fn fs_arranges_terminals_by_folders_and_points_where_native_does() {
+    let home = Home::new("fs");
+    let dir = home.dir.display().to_string();
+    let mut tui = Tui::start(&home, &[]);
+    tui.prompt();
+    tui.send("mkdir -p one two && cd one\r");
+    home.wait("the shell in one", || {
+        home.read(1).contains(&format!("{dir}/one"))
+    });
+    // a second terminal where the first is, entered; it goes to two
+    tui.send("\x07");
+    tui.text_is("panes");
+    tui.send("rfirst\r");
+    home.wait("first named", || home.read(1).contains("pane first"));
+    tui.send("asecond\r\r");
+    tui.wait("the second shell", |tui| tui.rows()[0].trim_end() == "$");
+    tui.send("cd ../two\r");
+    home.wait("the shell in two", || {
+        home.read(1).contains(&format!("{dir}/two"))
+    });
+    tui.send("\x07");
+    tui.text_is(" pane second ");
+    // the fs representation points to the same terminal, in its folder
+    tui.send("]");
+    tui.text_is(" terminal second in ~/two ");
+    assert!(tui.text().contains("one/") && tui.text().contains("two/"));
+    // back out, and to the folder next to it: its terminal
+    tui.send("hk");
+    tui.text_is(" terminal first in ~/one ");
+    // the native one points to it as well, and fs again
+    tui.send("[");
+    tui.text_is(" pane first ");
+    tui.send("]");
+    tui.text_is(" terminal first in ~/one ");
+    // only to move in: nothing to remove
+    tui.send("x");
+    assert!(!tui.text().contains("Remove?"));
+    tui.send("\r");
+    tui.wait("the view", |tui| !tui.text().contains(" native "));
+    home.wait("first entered", || !home.read(1).contains("active=2"));
+    tui.send("echo in-$((40 + 2))\r");
+    tui.text_is("in-42");
+    tui.detach("\x07");
+    home.stop();
+}
+
+#[test]
 fn same_and_different_sessions_share_only_session_state() {
     let home = Home::new("multi");
     // Simultaneous startup must reuse the one coordinator/session owner.

@@ -93,6 +93,7 @@ Default keys (overridable by decoration):
 |------------|-------------|--------|
 | view       | ctrl-g      | Open/close navigation (`t` in a pane does too) |
 | view       | enter       | Restart the focused stopped/exited terminal |
+| navigation | [ / ]       | Show the previous/next representation |
 | navigation | h/l, ←/→    | Focus the section left/right |
 | navigation | j/k, ↓/↑    | Hover next/previous; sections to the right follow |
 | navigation | a           | Add after hovered item, naming each level |
@@ -108,6 +109,27 @@ level; esc keeps the remaining automatic names (`workspace-2`, `window-1`, etc.)
 
 Removing cascades through empty containers and drops terminals no pane shows
 anymore. Stopping keeps structure; enter restarts the terminal.
+
+## Navigation: representations of the state
+
+Navigation shows a **representation** of the state: a mapping of it into
+sections. The tabs on its top border name them; `[` and `]` switch, around.
+Every representation points to the same terminal, the one in the bottom half:
+what one hovers or enters, the next one shown points to as well. The panel
+opens on `native`, at the focused pane.
+
+- **native**: the state as it is, a section per level, as above.
+- **fs**: the terminals panes show, by the folders they run in, only to move
+  in: no add, rename, remove or stop. A folder is an item where their paths
+  part or where some of them run; the folders between merge into it
+  (`web/src/`), and the root is the folder all share. Folders come first, by
+  name, then terminals in the order of their panes; one of an unknown folder
+  is at the top. Three sections, as in yazi: the list you came from, the
+  folder you are in, and where its hovered item leads, the items of a folder
+  or the panes showing a terminal. h/l go out/in, j/k hover (a folder points
+  to its first terminal), enter goes into a folder or the pane of a terminal:
+  the active pane of its session when that shows it, else the first. The
+  folders follow shells as they `cd`; the place stays by path, not position.
 
 ## State: global wrapper and independent session files
 
@@ -132,7 +154,9 @@ catalog version=1 {
 A client node exists only while connected. Edit its `session` to switch that
 instance, or delete its node to disconnect it. Navigation's session is also a
 **stable id**, not the session's position in the catalog. The other locations
-count from 1. Disconnected clients are discarded on server restart.
+count from 1. Showing fs, navigation adds `representation=fs`, and
+`folder="/path"` while a folder is hovered rather than the terminal.
+Disconnected clients are discarded on server restart.
 
 For a global file `/path/global-state.kdl`, session 4 lives in:
 
@@ -198,6 +222,8 @@ keys {
     right l right
     next j down
     previous k up
+    previous-tab "["
+    next-tab "]"
     add a
     rename r
     remove x
@@ -297,10 +323,12 @@ return {
 ```
 
 Handlers return a new state or nothing to keep their in-place edits. Existing
-one-argument handlers still work. Session tables have a stable `id`, and
-`workspaces` of `windows` of `panes`; levels and locations name `session`,
-`workspace`, `window` and `pane`. Plugins of the earlier shape, with `windows`
-of `tabs`, need the new names.
+one-argument handlers still work. `navigate` keys run while the native
+representation shows; `navigation.representation` tells which (`native`,
+`fs`), and `navigation.folder` the folder fs hovers. Session tables have a
+stable `id`, and `workspaces` of `windows` of `panes`; levels and locations
+name `session`, `workspace`, `window` and `pane`. Plugins of the earlier
+shape, with `windows` of `tabs`, need the new names.
 Layouts/keys from later plugins override earlier plugins and built-ins; automatic
 hooks run in global/session order. `print` is reported as a notice.
 
@@ -322,8 +350,9 @@ cargo clippy --all-targets -- -D warnings
 Tests include real multi-client PTYs, same/different sessions, foreign-session
 navigation edits, concurrent startup, live files, reconnect/restart, per-instance
 profiles, decoration precedence/reload, inside attach and commands, resize
-ownership, REPL confirmation, forced shutdown, and the conversations of programs
-with the terminal around (keys, focus, colors, clipboard, titles, progress).
+ownership, REPL confirmation, forced shutdown, the fs representation following
+shells into folders, and the conversations of programs with the terminal
+around (keys, focus, colors, clipboard, titles, progress).
 
 PTY content stays in memory: disconnect/reconnect preserves it, server restart
 does not. State persists and starts the terminals that should run again. No

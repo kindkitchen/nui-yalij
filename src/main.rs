@@ -8,6 +8,7 @@ mod app;
 mod cli;
 mod client;
 mod decoration;
+mod folders;
 mod global;
 mod input;
 mod ipc;

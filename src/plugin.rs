@@ -4,6 +4,7 @@
 //!
 //! - `layouts`: layout strategies by name, `function(container) -> placement`;
 //! - `keys`: handlers by mode (`view`, `navigate`) and key, `function(state) -> state?`;
+//!   `navigate` ones while navigation shows the native representation;
 //! - `update`: a hook after every change of the state, `function(state) -> state?`.
 //!
 //! Keys receive the plain Nui projection and viewer context, indices from 1.

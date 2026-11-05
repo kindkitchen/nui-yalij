@@ -227,7 +227,7 @@ pub(crate) fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{Level, Location};
+    use crate::state::{Level, Location, StateRepresentation};
 
     #[test]
     fn catalog_is_thin_and_navigation_uses_stable_ids() {
@@ -239,11 +239,13 @@ mod tests {
                 profile: Some("work".into()),
                 message: Some("hello".into()),
                 navigation: Some(Navigation {
+                    representation: StateRepresentation::Fs,
                     focus: Level::Pane,
                     cursor: Location {
                         session: 1,
                         ..Location::default()
                     },
+                    folder: Some("/home/me".into()),
                     operation: None,
                 }),
             }],

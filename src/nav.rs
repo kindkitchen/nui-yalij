@@ -1,11 +1,16 @@
-//! The navigation panel, yazi style: a section per level, sessions to panes.
+//! The navigation panel, yazi style: a representation of the state in
+//! sections, shown as a tab; `[` and `]` switch them. The native one has a
+//! section per level, sessions to panes; the fs one is in `folders`.
 //!
 //! Like everything else it only changes the state: the panel is drawn from
-//! `Nui::navigation`, and its operations are the ones of the state.
+//! `Nui::navigation`, and its operations are the ones of the state. Every
+//! representation points to the terminal of the hovered pane, so the next
+//! one shown points to it too.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::state::{Level, Location, Navigation, Nui, Operation};
+use crate::folders;
+use crate::state::{Level, Location, Navigation, Nui, Operation, StateRepresentation};
 
 /// What a key in the panel asks of the application, beyond the state.
 #[derive(Debug, PartialEq)]
@@ -19,8 +24,10 @@ pub enum Outcome {
 pub fn open(nui: &mut Nui) {
     if let Some(cursor) = nui.location() {
         nui.navigation = Some(Navigation {
+            representation: StateRepresentation::Native,
             focus: Level::Pane,
             cursor,
+            folder: None,
             operation: None,
         });
     }
@@ -34,9 +41,11 @@ pub fn close(nui: &mut Nui) {
 /// Handle a key of the panel; new terminals run `shell`.
 pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
     let Some(Navigation {
+        representation,
         focus,
         cursor,
         operation,
+        ..
     }) = nui.navigation.clone()
     else {
         return Outcome::Stay;
@@ -87,29 +96,64 @@ pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
             _ => {}
         },
         None => match key.code {
-            KeyCode::Char('h') | KeyCode::Left => move_focus(nui, -1),
-            KeyCode::Char('l') | KeyCode::Right => move_focus(nui, 1),
-            KeyCode::Char('j') | KeyCode::Down => move_cursor(nui, 1),
-            KeyCode::Char('k') | KeyCode::Up => move_cursor(nui, -1),
-            KeyCode::Char('a') => create(nui, focus, cursor, shell),
-            KeyCode::Char('r') => {
-                let input = name(nui, focus, cursor);
-                set_operation(nui, Some(Operation::Rename { input }));
-            }
-            KeyCode::Char('x') => set_operation(nui, Some(Operation::Remove)),
-            KeyCode::Char('s') => set_operation(nui, Some(Operation::Stop)),
-            KeyCode::Enter if focus == Level::Pane => nui.enter(cursor),
-            KeyCode::Enter => move_focus(nui, 1),
+            KeyCode::Char('[') => switch(nui, -1),
+            KeyCode::Char(']') => switch(nui, 1),
             KeyCode::Esc => close(nui),
             KeyCode::Char('q') => {
                 close(nui);
                 return Outcome::Quit;
             }
             KeyCode::Char('Q') => return Outcome::Shutdown,
-            _ => {}
+            code => match representation {
+                StateRepresentation::Native => native(nui, focus, cursor, code, shell),
+                StateRepresentation::Fs => fs(nui, code),
+            },
         },
     }
     Outcome::Stay
+}
+
+/// A key of the native representation: a move, or an operation on the
+/// hovered item.
+fn native(nui: &mut Nui, focus: Level, cursor: Location, code: KeyCode, shell: &str) {
+    match code {
+        KeyCode::Char('h') | KeyCode::Left => move_focus(nui, -1),
+        KeyCode::Char('l') | KeyCode::Right => move_focus(nui, 1),
+        KeyCode::Char('j') | KeyCode::Down => move_cursor(nui, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_cursor(nui, -1),
+        KeyCode::Char('a') => create(nui, focus, cursor, shell),
+        KeyCode::Char('r') => {
+            let input = name(nui, focus, cursor);
+            set_operation(nui, Some(Operation::Rename { input }));
+        }
+        KeyCode::Char('x') => set_operation(nui, Some(Operation::Remove)),
+        KeyCode::Char('s') => set_operation(nui, Some(Operation::Stop)),
+        KeyCode::Enter if focus == Level::Pane => nui.enter(cursor),
+        KeyCode::Enter => move_focus(nui, 1),
+        _ => {}
+    }
+}
+
+/// A key of the fs representation: only moves, and entering a pane.
+fn fs(nui: &mut Nui, code: KeyCode) {
+    match code {
+        KeyCode::Char('h') | KeyCode::Left => folders::outward(nui),
+        KeyCode::Char('l') | KeyCode::Right => folders::inward(nui),
+        KeyCode::Char('j') | KeyCode::Down => folders::step(nui, 1),
+        KeyCode::Char('k') | KeyCode::Up => folders::step(nui, -1),
+        KeyCode::Enter => folders::enter(nui),
+        _ => {}
+    }
+}
+
+/// Show the representation `delta` tabs further, pointing to the terminal
+/// the shown one points to.
+fn switch(nui: &mut Nui, delta: isize) {
+    if let Some(navigation) = nui.navigation.as_mut() {
+        navigation.representation = navigation.representation.step(delta);
+        navigation.focus = Level::Pane;
+        navigation.folder = None;
+    }
 }
 
 /// Pasted text goes into a name being typed, as typed.
@@ -267,6 +311,43 @@ mod tests {
                 ..Location::default()
             })
         );
+    }
+
+    #[test]
+    fn every_representation_points_to_the_same_terminal() {
+        let mut nui = crate::folders::tests::foldered();
+        open(&mut nui);
+        let shown = |nui: &Nui| nui.navigation.as_ref().unwrap().representation;
+        // the first terminal again, at the second pane of the first window
+        press(&mut nui, "j]");
+        assert_eq!(shown(&nui), StateRepresentation::Fs);
+        assert_eq!(
+            cursor(&nui).1,
+            Location {
+                pane: 1,
+                ..Location::default()
+            }
+        );
+        // the folder next to its own: the first terminal there
+        press(&mut nui, "hk");
+        let top = Location {
+            window: 1,
+            ..Location::default()
+        };
+        assert_eq!(cursor(&nui).1, top);
+        // the native representation points to it as well, then fs again
+        press(&mut nui, "[");
+        assert_eq!(
+            (shown(&nui), cursor(&nui)),
+            (StateRepresentation::Native, (Level::Pane, top))
+        );
+        press(&mut nui, "]");
+        assert_eq!(nui.navigation.as_ref().unwrap().folder, None);
+        // only to move in: no operation starts
+        press(&mut nui, "arxs");
+        assert!(nui.navigation.as_ref().unwrap().operation.is_none());
+        press(&mut nui, "\n");
+        assert_eq!(nui.location(), Some(top));
     }
 
     #[test]

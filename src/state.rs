@@ -113,15 +113,34 @@ pub enum Status {
     Exited,
 }
 
-/// The navigation panel: a section per level, an item hovered in each.
+/// The navigation panel: a representation of the state in sections, shown
+/// as a tab, and the pane every representation points to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Navigation {
-    /// The focused section.
+    /// The representation shown.
+    #[serde(default)]
+    pub representation: StateRepresentation,
+    /// The focused section of the native representation.
     pub focus: Level,
-    /// The hovered item of every section.
+    /// The hovered pane, through the hovered item of every native section:
+    /// each representation points to the terminal it shows.
     pub cursor: Location,
+    /// The folder hovered in the fs representation; none when it is the
+    /// terminal itself.
+    pub folder: Option<String>,
     /// The operation waiting for approval.
     pub operation: Option<Operation>,
+}
+
+/// A mapping of the state for navigation; the panel shows one at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateRepresentation {
+    /// The state as it is: a section per level, sessions to panes.
+    #[default]
+    Native,
+    /// The terminals by the folders they run in, only to move in.
+    Fs,
 }
 
 /// An operation on the hovered item of the focused section.
@@ -227,6 +246,30 @@ impl Operation {
             Operation::Rename { input } | Operation::Create { input } => Some(input),
             Operation::Remove | Operation::Stop => None,
         }
+    }
+}
+
+impl StateRepresentation {
+    pub const ALL: [StateRepresentation; 2] =
+        [StateRepresentation::Native, StateRepresentation::Fs];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            StateRepresentation::Native => "native",
+            StateRepresentation::Fs => "fs",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<StateRepresentation> {
+        StateRepresentation::ALL
+            .into_iter()
+            .find(|representation| representation.name() == name)
+    }
+
+    /// The representation `delta` tabs further, around.
+    pub fn step(self, delta: isize) -> StateRepresentation {
+        let count = StateRepresentation::ALL.len() as isize;
+        StateRepresentation::ALL[(self as isize + delta).rem_euclid(count) as usize]
     }
 }
 
@@ -413,6 +456,18 @@ impl Nui {
 
     pub fn pane(&self, at: Location) -> Option<&Pane> {
         self.window(at)?.panes.get(at.pane)
+    }
+
+    /// The location of every pane, in order.
+    pub fn locations(&self) -> Vec<Location> {
+        let mut locations = vec![Location::default()];
+        for level in Level::ALL {
+            locations = locations
+                .into_iter()
+                .flat_map(|at| (0..self.count(level, at)).map(move |index| at.with(level, index)))
+                .collect();
+        }
+        locations
     }
 
     /// The terminal the pane at `at` shows.
