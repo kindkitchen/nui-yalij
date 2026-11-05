@@ -315,15 +315,6 @@ pub fn enter(nui: &mut Nui) {
     }
 }
 
-/// The panes showing the terminal shown at `at`, in order.
-pub fn panes(nui: &Nui, at: Location) -> Vec<Location> {
-    let terminal = |at: Location| nui.pane(at).map(|pane| (at.session, pane.terminal));
-    nui.locations()
-        .into_iter()
-        .filter(|other| terminal(*other) == terminal(at))
-        .collect()
-}
-
 /// A path as people read it: in the home, from `~`.
 pub fn tilde(path: &Path, home: Option<&Path>) -> String {
     match home.and_then(|home| path.strip_prefix(home).ok()) {
@@ -404,8 +395,8 @@ pub(crate) mod tests {
 
     /// Navigation in the fs representation, the folder `folder` hovered.
     fn navigate(nui: &mut Nui, cursor: Location, folder: Option<&str>) {
+        nui.representation = StateRepresentation::Fs;
         nui.navigation = Some(Navigation {
-            representation: StateRepresentation::Fs,
             focus: Level::Pane,
             cursor,
             folder: folder.map(Into::into),
@@ -483,10 +474,6 @@ pub(crate) mod tests {
         assert_eq!(pane(at(0, 0, 0, 1)), Some(at(0, 0, 0, 1)));
         // pointed elsewhere, it is at the active pane of its session
         assert_eq!(pane(at(0, 1, 0, 0)), Some(at(0, 0, 0, 0)));
-        assert_eq!(
-            panes(&nui, at(0, 0, 0, 1)),
-            [at(0, 0, 0, 0), at(0, 0, 0, 1)]
-        );
     }
 
     #[test]

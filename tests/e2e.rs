@@ -231,7 +231,7 @@ impl Tui {
         self.wait(text, |tui| tui.text().contains(text));
     }
     fn view(&self) {
-        self.wait("the view", |tui| !tui.text().contains("sessions"));
+        self.wait("the view", |tui| !tui.text().contains(" native "));
     }
     fn prompt(&self) {
         self.wait("a prompt", |tui| tui.rows()[0].starts_with('$'));
@@ -253,7 +253,7 @@ impl Tui {
     }
     fn detach(&mut self, toggle: &str) {
         self.send(toggle);
-        self.text_is("sessions");
+        self.text_is(" native ");
         self.send("q");
         self.exited();
     }
@@ -287,7 +287,7 @@ fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
     assert!(!home.read(1).contains("toggle"));
     tui.send("echo hello-$((6 * 7))\r");
     tui.text_is("hello-42");
-    tui.send("\x07");
+    tui.send("\x14");
     tui.text_is("panes");
     assert!(
         tui.rows()
@@ -307,7 +307,7 @@ fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
         &home.session(1),
         &home.read(1).replace("pane logs", "pane edited"),
     );
-    tui.send("\x07");
+    tui.send("\x14");
     tui.text_is("1 edited");
     home.write(&home.session(1), "session {");
     tui.text_is("session 1:");
@@ -331,7 +331,7 @@ fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
     tui.send("echo after-restart\r");
     tui.text_is("after-restart");
     let pid = home.pid(1, 1).unwrap();
-    tui.detach("\x07");
+    tui.detach("\x14");
     assert_eq!(home.pid(1, 1), Some(pid));
     let mut again = Tui::start(&home, &["attach", "dev"]);
     again.text_is("after-restart");
@@ -341,7 +341,7 @@ fn navigation_file_edits_stop_reconnect_and_legacy_migration() {
             .contains("would stop 1 session server(s), 1 connected")
     );
     assert_eq!(home.pid(1, 1), Some(pid));
-    again.detach("\x07");
+    again.detach("\x14");
     assert!(
         home.ok(&["list"])
             .contains("dev  id: 1  workspaces: 1  windows: 1  panes: 1")
@@ -360,7 +360,7 @@ fn fs_arranges_terminals_by_folders_and_points_where_native_does() {
         home.read(1).contains(&format!("{dir}/one"))
     });
     // a second terminal where the first is, entered; it goes to two
-    tui.send("\x07");
+    tui.send("\x14");
     tui.text_is("panes");
     tui.send("rfirst\r");
     home.wait("first named", || home.read(1).contains("pane first"));
@@ -370,29 +370,60 @@ fn fs_arranges_terminals_by_folders_and_points_where_native_does() {
     home.wait("the shell in two", || {
         home.read(1).contains(&format!("{dir}/two"))
     });
-    tui.send("\x07");
-    tui.text_is(" pane second ");
+    let top = |tui: &Tui| tui.rows()[..ROWS as usize / 2].join("\n");
+    let bottom = |tui: &Tui| tui.rows()[ROWS as usize / 2..].join("\n");
+    // the hovered pane's terminal previewed, over the one navigation is opened from
+    tui.send("\x14");
+    tui.wait("second previewed", |tui| {
+        top(tui).contains(" workspaces") && top(tui).contains("cd ../two")
+    });
+    tui.wait("where it was opened", |tui| {
+        bottom(tui).contains(" main › second › second › second ")
+            && bottom(tui).contains("cd ../two")
+    });
     // the fs representation points to the same terminal, in its folder
     tui.send("]");
-    tui.text_is(" terminal second in ~/two ");
-    assert!(tui.text().contains("one/") && tui.text().contains("two/"));
-    // back out, and to the folder next to it: its terminal
+    tui.wait("fs at second", |tui| {
+        !top(tui).contains(" workspaces")
+            && top(tui).contains(" ~/two")
+            && top(tui).contains("cd ../two")
+    });
+    // back out, and to the folder next to it: its items; into it, the screen
+    // of its terminal
     tui.send("hk");
-    tui.text_is(" terminal first in ~/one ");
+    tui.wait("one/ hovered", |tui| {
+        top(tui).contains(" ~/one") && !top(tui).contains("mkdir")
+    });
+    tui.send("l");
+    tui.wait("first previewed", |tui| {
+        top(tui).contains("mkdir -p one two")
+    });
+    assert!(bottom(&tui).contains("cd ../two") && !bottom(&tui).contains("mkdir"));
     // the native one points to it as well, and fs again
     tui.send("[");
-    tui.text_is(" pane first ");
+    tui.wait("native at first", |tui| {
+        top(tui).contains(" workspaces") && top(tui).contains("mkdir -p one two")
+    });
     tui.send("]");
-    tui.text_is(" terminal first in ~/one ");
+    tui.wait("fs at first", |tui| {
+        !top(tui).contains(" workspaces") && top(tui).contains("mkdir -p one two")
+    });
     // only to move in: nothing to remove
     tui.send("x");
     assert!(!tui.text().contains("Remove?"));
     tui.send("\r");
-    tui.wait("the view", |tui| !tui.text().contains(" native "));
+    tui.view();
     home.wait("first entered", || !home.read(1).contains("active=2"));
     tui.send("echo in-$((40 + 2))\r");
     tui.text_is("in-42");
-    tui.detach("\x07");
+    // the panel opens again on the tab it showed last
+    tui.send("\x14");
+    tui.wait("fs again", |tui| {
+        top(tui).contains(" ~/one") && !top(tui).contains(" workspaces")
+    });
+    tui.send("\x1b");
+    tui.view();
+    tui.detach("\x14");
     home.stop();
 }
 
@@ -414,7 +445,7 @@ fn same_and_different_sessions_share_only_session_state() {
     assert!(!c.text().contains("shared-output"));
 
     // Edit a foreign session without entering it, then return to the original.
-    a.send("\x07");
+    a.send("\x14");
     a.text_is("panes");
     a.send("hhhjlllrforeign\r");
     home.wait("edit reaches the other owner", || {
@@ -424,14 +455,14 @@ fn same_and_different_sessions_share_only_session_state() {
     a.view();
     a.text_is("shared-output");
     assert_eq!(home.pid(1, 1), Some(pid));
-    c.send("\x07");
+    c.send("\x14");
     c.text_is("1 foreign");
     c.send("\x1b");
     c.view();
 
     // Both clients add against the latest authoritative state: no lost update.
-    a.send("\x07");
-    b.send("\x07");
+    a.send("\x14");
+    b.send("\x14");
     a.text_is("panes");
     b.text_is("panes");
     a.send("aone\r");
@@ -527,7 +558,7 @@ fn per_instance_profiles_static_reload_and_live_session_override() {
     plain.view();
     home.ok(&["reload"]);
     plain.send("\x01");
-    assert!(!plain.text().contains("sessions"));
+    assert!(!plain.text().contains(" native "));
     plain.send("\x03");
     plain.text_is("panes");
     plain.send("\x1b");
@@ -596,7 +627,7 @@ fn plugins_and_inside_attach_route_to_the_typing_instance() {
     tui.wait("two columns", |tui| {
         tui.rows()[0].starts_with('$') && tui.rows()[0].contains("│$")
     });
-    tui.send("\x07");
+    tui.send("\x14");
     tui.text_is("panes");
     tui.send("n");
     home.wait("third terminal", || home.read(1).contains("terminal 3"));
@@ -620,8 +651,8 @@ fn plugins_and_inside_attach_route_to_the_typing_instance() {
         watcher.rows()[0].contains("│$"),
         "inside attach must not drag other viewers along"
     );
-    watcher.detach("\x07");
-    tui.detach("\x07");
+    watcher.detach("\x14");
+    tui.detach("\x14");
 }
 
 #[test]
@@ -666,8 +697,8 @@ fn programs_talk_to_the_terminal_around_through_the_client() {
             && raw.contains("\x1b]2;title-45\x07")
             && raw.contains("\x1b]9;4;3;0\x07")
     });
-    // ctrl with the key of g on a Ukrainian layout is ctrl-g; progress shows
-    tui.send("\x1b[1087::103;5u");
+    // ctrl with the key of t on a Ukrainian layout is ctrl-t; progress shows
+    tui.send("\x1b[1077::116;5u");
     tui.text_is("panes");
     tui.text_is("working");
     tui.send("\x1b[27u");
@@ -679,9 +710,9 @@ fn programs_talk_to_the_terminal_around_through_the_client() {
     plain.wait("questions", |tui| tui.raw().contains("\x1b[c"));
     plain.send("\x1b[?62;22c");
     plain.wait("modifyOtherKeys", |tui| tui.raw().contains("\x1b[>4;2m"));
-    plain.detach("\x07");
+    plain.detach("\x14");
     plain.wait("taken back", |tui| tui.raw().contains("\x1b[>4;0m"));
-    tui.detach("\x07");
+    tui.detach("\x14");
     tui.wait("taken back", |tui| tui.raw().contains("\x1b[<u"));
 }
 
@@ -750,8 +781,8 @@ fn last_typing_client_owns_shared_terminal_size() {
             .contains("message"),
         "resize must not query a nonexistent server TTY"
     );
-    a.detach("\x07");
-    b.detach("\x07");
+    a.detach("\x14");
+    b.detach("\x14");
 }
 
 #[test]
@@ -779,7 +810,7 @@ fn repl_completes_then_requires_explicit_yes_even_with_apply() {
     accepted.send("y\r");
     accepted.prompt();
     home.wait("session created", || home.read(1).contains("session draft"));
-    accepted.detach("\x07");
+    accepted.detach("\x14");
     let pid = home.pid(1, 1).unwrap();
 
     let mut no = Tui::start(&home, &["kill", "--repl", "--apply"]);
@@ -830,7 +861,7 @@ fn shutdown_restarts_from_independent_session_states() {
     again.send("\r");
     again.prompt();
     assert_ne!(home.pid(1, 1), Some(first));
-    again.send("\x07");
+    again.send("\x14");
     again.text_is("panes");
     again.send("Q");
     again.exited();
@@ -889,7 +920,7 @@ fn deleting_one_client_node_disconnects_only_that_instance() {
     b.send("echo still-here\r");
     b.text_is("still-here");
     assert_eq!(home.pid(1, 1), Some(pid));
-    b.detach("\x07");
+    b.detach("\x14");
 }
 
 #[test]

@@ -47,7 +47,7 @@ asks Apply? (N/y). Nothing executes before y, even with --apply.
 
 State: $XDG_STATE_HOME/nui-yalij/global-state.kdl (~/.local/state/...).
 Decoration: $XDG_CONFIG_HOME/nui-yalij (~/.config/...). Profiles are per
-instance; active windows/panes are shared state. ctrl-g, or t inside a pane,
+instance; active windows/panes are shared state. ctrl-t, or t inside a pane,
 opens navigation: q disconnects only this instance; Q stops this catalog's servers.
 ";
 

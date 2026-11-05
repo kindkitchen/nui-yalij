@@ -20,7 +20,7 @@ use crate::{
 };
 
 const ACTIONS: [(&str, &[&str]); 16] = [
-    ("panel", &["ctrl-g"]),
+    ("panel", &["ctrl-t"]),
     ("left", &["h", "left"]),
     ("right", &["l", "right"]),
     ("next", &["j", "down"]),
@@ -100,8 +100,8 @@ impl Icons {
 
     pub fn terminal(self) -> &'static str {
         match self {
-            // nf-fa-terminal
-            Icons::Nerd => "\u{f120}",
+            // nf-dev-terminal
+            Icons::Nerd => "\u{e795}",
             Icons::Plain => "$",
         }
     }

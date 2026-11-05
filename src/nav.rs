@@ -1,6 +1,7 @@
 //! The navigation panel, yazi style: a representation of the state in
-//! sections, shown as a tab; `[` and `]` switch them. The native one has a
-//! section per level, sessions to panes; the fs one is in `folders`.
+//! sections, shown as a tab; `[` and `]` switch them, and the panel opens on
+//! the one it showed last. The native one has a section per level, sessions
+//! to panes; the fs one is in `folders`.
 //!
 //! Like everything else it only changes the state: the panel is drawn from
 //! `Nui::navigation`, and its operations are the ones of the state. Every
@@ -24,7 +25,6 @@ pub enum Outcome {
 pub fn open(nui: &mut Nui) {
     if let Some(cursor) = nui.location() {
         nui.navigation = Some(Navigation {
-            representation: StateRepresentation::Native,
             focus: Level::Pane,
             cursor,
             folder: None,
@@ -41,7 +41,6 @@ pub fn close(nui: &mut Nui) {
 /// Handle a key of the panel; new terminals run `shell`.
 pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
     let Some(Navigation {
-        representation,
         focus,
         cursor,
         operation,
@@ -50,6 +49,7 @@ pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
     else {
         return Outcome::Stay;
     };
+    let representation = nui.representation;
     nui.message = None;
     match operation {
         Some(mut operation @ (Operation::Rename { .. } | Operation::Create { .. })) => {
@@ -150,7 +150,7 @@ fn fs(nui: &mut Nui, code: KeyCode) {
 /// the shown one points to.
 fn switch(nui: &mut Nui, delta: isize) {
     if let Some(navigation) = nui.navigation.as_mut() {
-        navigation.representation = navigation.representation.step(delta);
+        nui.representation = nui.representation.step(delta);
         navigation.focus = Level::Pane;
         navigation.folder = None;
     }
@@ -317,7 +317,7 @@ mod tests {
     fn every_representation_points_to_the_same_terminal() {
         let mut nui = crate::folders::tests::foldered();
         open(&mut nui);
-        let shown = |nui: &Nui| nui.navigation.as_ref().unwrap().representation;
+        let shown = |nui: &Nui| nui.representation;
         // the first terminal again, at the second pane of the first window
         press(&mut nui, "j]");
         assert_eq!(shown(&nui), StateRepresentation::Fs);
@@ -348,6 +348,12 @@ mod tests {
         assert!(nui.navigation.as_ref().unwrap().operation.is_none());
         press(&mut nui, "\n");
         assert_eq!(nui.location(), Some(top));
+        // the panel opens again on the representation it showed
+        open(&mut nui);
+        assert_eq!(shown(&nui), StateRepresentation::Fs);
+        press(&mut nui, "\x1b");
+        open(&mut nui);
+        assert_eq!(shown(&nui), StateRepresentation::Fs);
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct Nui {
     pub sessions: Vec<Session>,
     /// The navigation panel, while open.
     pub navigation: Option<Navigation>,
+    /// The representation navigation shows; it stays as left while closed.
+    pub representation: StateRepresentation,
     /// A notice for the person: an error, or what a plugin printed.
     pub message: Option<String>,
 }
@@ -117,9 +119,6 @@ pub enum Status {
 /// as a tab, and the pane every representation points to.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Navigation {
-    /// The representation shown.
-    #[serde(default)]
-    pub representation: StateRepresentation,
     /// The focused section of the native representation.
     pub focus: Level,
     /// The hovered pane, through the hovered item of every native section:

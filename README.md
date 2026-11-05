@@ -61,7 +61,7 @@ typed into that terminal, not every viewer. The spawned shell inherits
 `NUI_YALIJ_STATE`, `NUI_YALIJ_SESSION` and `NUI_YALIJ_TERMINAL` for this routing.
 
 Inside a pane, `t` opens/closes navigation for the instance that last typed
-there, as `ctrl-g` does. It is a command of decoration, not an installed
+there, as `ctrl-t` does. It is a command of decoration, not an installed
 program: each session writes its commands as scripts into
 `<global.kdl>.sessions/<id>/bin`, first on the `PATH` of its terminals, so they
 exist nowhere else. A shell alias or function of the same name shadows them.
@@ -91,7 +91,7 @@ Default keys (overridable by decoration):
 
 | Where      | Key         | Action |
 |------------|-------------|--------|
-| view       | ctrl-g      | Open/close navigation (`t` in a pane does too) |
+| view       | ctrl-t      | Open/close navigation (`t` in a pane does too) |
 | view       | enter       | Restart the focused stopped/exited terminal |
 | navigation | [ / ]       | Show the previous/next representation |
 | navigation | h/l, ←/→    | Focus the section left/right |
@@ -113,12 +113,15 @@ anymore. Stopping keeps structure; enter restarts the terminal.
 ## Navigation: representations of the state
 
 Navigation shows a **representation** of the state: a mapping of it into
-sections. The tabs on its top border name them; `[` and `]` switch, around.
-Every representation points to the same terminal, the one in the bottom half:
-what one hovers or enters, the next one shown points to as well. The panel
-opens on `native`, at the focused pane.
+sections, as in yazi. The tabs on its top border name them; `[` and `]`
+switch, around, and the panel opens again on the one it showed last, at the
+focused pane. Every representation points to the same terminal, the one its
+last section previews: what one hovers or enters, the next one shown points
+to as well. The bottom half stays the terminal you opened the panel from.
 
-- **native**: the state as it is, a section per level, as above.
+- **native**: the state as it is, a section per level as above, then the
+  screen of the hovered pane's terminal. Sessions stay folded to the hovered
+  one but while focused; the preview folds then, so neither widens the rest.
 - **fs**: the terminals panes show, by the folders they run in, only to move
   in: no add, rename, remove or stop. A folder is an item where their paths
   part or where some of them run; the folders between merge into it
@@ -126,7 +129,7 @@ opens on `native`, at the focused pane.
   name, then terminals in the order of their panes; one of an unknown folder
   is at the top. Three sections, as in yazi: the list you came from, the
   folder you are in, and where its hovered item leads, the items of a folder
-  or the panes showing a terminal. h/l go out/in, j/k hover (a folder points
+  or the screen of a terminal. h/l go out/in, j/k hover (a folder points
   to its first terminal), enter goes into a folder or the pane of a terminal:
   the active pane of its session when that shows it, else the first. The
   folders follow shells as they `cd`; the place stays by path, not position.
@@ -155,9 +158,10 @@ catalog version=1 {
 A client node exists only while connected. Edit its `session` to switch that
 instance, or delete its node to disconnect it. Navigation's session is also a
 **stable id**, not the session's position in the catalog. The other locations
-count from 1. Showing fs, navigation adds `representation=fs`, and
-`folder="/path"` while a folder is hovered rather than the terminal.
-Disconnected clients are discarded on server restart.
+count from 1. An instance whose panel shows fs, open or not, has
+`representation=fs`; its navigation has `folder="/path"` while a folder is
+hovered rather than the terminal. Disconnected clients are discarded on
+server restart.
 
 For a global file `/path/global-state.kdl`, session 4 lives in:
 
@@ -218,7 +222,7 @@ All three levels have the same KDL schema:
 
 ```kdl
 keys {
-    panel ctrl-g
+    panel ctrl-t
     left h left
     right l right
     next j down
@@ -278,7 +282,7 @@ client asks the terminal around it on attach, giving everything back on exit:
   shift+enter. The client reads keys in any encoding of the terminal around; a
   program asking for neither gets enter.
 - **Layouts:** ctrl, alt or super with a key counts as the key of the base
-  layout, when the terminal around tells it: `ctrl-g` opens navigation on a
+  layout, when the terminal around tells it: `ctrl-t` opens navigation on a
   Ukrainian layout too.
 - **Focus** (DEC 1004), **colors** (OSC 10/11/4) and the **color scheme**
   (`CSI ? 996 n`, DEC 2031): from the terminal around the instance that typed
@@ -331,8 +335,8 @@ return {
 
 Handlers return a new state or nothing to keep their in-place edits. Existing
 one-argument handlers still work. `navigate` keys run while the native
-representation shows; `navigation.representation` tells which (`native`,
-`fs`), and `navigation.folder` the folder fs hovers. Session tables have a
+representation shows; `representation` tells which (`native`, `fs`), and
+`navigation.folder` the folder fs hovers. Session tables have a
 stable `id`, and `workspaces` of `windows` of `panes`; levels and locations
 name `session`, `workspace`, `window` and `pane`. Plugins of the earlier
 shape, with `windows` of `tabs`, need the new names.

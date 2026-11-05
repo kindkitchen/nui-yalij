@@ -204,6 +204,7 @@ impl App {
                 .position(|id| *id == client.session)
                 .unwrap_or(0);
             nui.navigation = client.navigation.clone();
+            nui.representation = client.representation;
             nui.message = client.message.clone();
         }
         nui
@@ -433,6 +434,7 @@ impl App {
                 presence.session = session.id;
             }
             presence.navigation = next.navigation;
+            presence.representation = next.representation;
             presence.message = next.message;
         }
         self.cleanup();
@@ -582,6 +584,7 @@ impl App {
                     session,
                     profile,
                     navigation: None,
+                    representation: StateRepresentation::Native,
                     message: None,
                 });
                 self.peers.get_mut(&id).unwrap().render = Some(render);
@@ -737,7 +740,7 @@ impl App {
         }
         // plugin keys of navigation act on the native representation
         if next.navigation.as_ref().is_none_or(|nav| {
-            nav.operation.is_none() && nav.representation == StateRepresentation::Native
+            nav.operation.is_none() && next.representation == StateRepresentation::Native
         }) {
             let plugins = self
                 .views
@@ -1021,7 +1024,7 @@ impl App {
                 };
                 render
                     .terminal
-                    .draw(|frame| ui::navigation(frame, &nui, &screens, &decoration, &mut place))
+                    .draw(|frame| ui::navigation(frame, &nui, &screens, &decoration))
             } else {
                 let root = Location {
                     session: nui.attached,

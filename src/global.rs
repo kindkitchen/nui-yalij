@@ -10,7 +10,7 @@ use ::kdl::{KdlDocument, KdlNode, KdlValue};
 
 use crate::{
     kdl::{self, node},
-    state::{Navigation, Nui},
+    state::{Navigation, Nui, StateRepresentation},
     store::suffixed,
 };
 
@@ -26,6 +26,8 @@ pub struct Client {
     pub session: u64,
     pub profile: Option<String>,
     pub navigation: Option<Navigation>,
+    /// The representation navigation shows, kept while it is closed.
+    pub representation: StateRepresentation,
     pub message: Option<String>,
 }
 
@@ -56,6 +58,9 @@ impl Catalog {
                 .prop("session", client.session as i128);
             if let Some(profile) = &client.profile {
                 child = child.prop("profile", profile.as_str());
+            }
+            if client.representation != StateRepresentation::Native {
+                child = child.prop("representation", client.representation.name());
             }
             if let Some(nav) = &client.navigation {
                 let mut nav = nav.clone();
@@ -107,7 +112,7 @@ impl Catalog {
                     check(
                         child,
                         "client",
-                        &["session", "profile"],
+                        &["session", "profile", "representation"],
                         &["navigation", "message"],
                         1,
                     )?;
@@ -117,6 +122,13 @@ impl Catalog {
                     }
                     let session = positive(child.get("session"), "client session")?;
                     let profile = optional_string(child.get("profile"), "profile")?;
+                    let representation =
+                        match optional_string(child.get("representation"), "representation")? {
+                            None => StateRepresentation::Native,
+                            Some(name) => StateRepresentation::parse(&name).ok_or_else(|| {
+                                format!("client {id}: unknown representation {name}")
+                            })?,
+                        };
                     let mut projection = Nui::default();
                     if !children(child).is_empty() {
                         let inner = children(child)
@@ -131,6 +143,7 @@ impl Catalog {
                         session,
                         profile,
                         navigation: projection.navigation,
+                        representation,
                         message: projection.message,
                     });
                 }
@@ -239,7 +252,6 @@ mod tests {
                 profile: Some("work".into()),
                 message: Some("hello".into()),
                 navigation: Some(Navigation {
-                    representation: StateRepresentation::Fs,
                     focus: Level::Pane,
                     cursor: Location {
                         session: 1,
@@ -248,10 +260,14 @@ mod tests {
                     folder: Some("/home/me".into()),
                     operation: None,
                 }),
+                representation: StateRepresentation::Fs,
             }],
         };
         let text = catalog.encode();
-        assert!(text.contains("session=3"), "{text}");
+        assert!(
+            text.contains("session=3") && text.contains("representation=fs"),
+            "{text}"
+        );
         assert!(!text.contains("terminal"));
         assert_eq!(Catalog::decode(&text).unwrap(), catalog);
     }
@@ -263,6 +279,7 @@ mod tests {
             "catalog version=1 { session 0 }",
             "catalog version=1 { session 1; session 1 }",
             "catalog version=1 { client 1 session=2 }",
+            "catalog version=1 { session 1; client 1 session=1 representation=tree }",
             "catalog version=1 oops=1",
         ] {
             assert!(Catalog::decode(text).is_err(), "{text}");
