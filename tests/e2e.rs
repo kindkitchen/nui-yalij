@@ -964,8 +964,11 @@ fn shutdown_restarts_from_independent_session_states() {
     let lock = fs::File::open(home.session(1).with_file_name("state.kdl.lock")).unwrap();
     assert!(matches!(lock.try_lock(), Err(fs::TryLockError::WouldBlock)));
     a.send("exit 5\r");
-    a.text_is("exited with 5");
-    home.wait("exit persisted", || home.read(1).contains("status=exited"));
+    a.text_is("exited"); // Long program labels may truncate the numeric status.
+    home.wait("exit persisted", || {
+        let state = home.read(1);
+        state.contains("status=exited") && state.contains("exit=5")
+    });
     home.stop();
     a.exited();
     b.exited();
@@ -978,7 +981,8 @@ fn shutdown_restarts_from_independent_session_states() {
     let mut again = Tui::start(&home, &["attach", "main"]);
     again.wait("client ready", |tui| tui.raw().contains("\x1b[?1049h"));
     again.send("\x14");
-    again.text_is("exited with 5");
+    again.text_is("exited");
+    assert!(home.read(1).contains("exit=5"));
     let mut other = Tui::start(&home, &["attach", "other"]);
     other.prompt();
     assert_ne!(home.pid(2, 1), Some(second));
