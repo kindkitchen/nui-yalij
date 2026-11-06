@@ -525,7 +525,28 @@ impl App {
                 if let Some(owner) = self.owners.get_mut(&session) {
                     if owner.runtime.exited(id, generation) {
                         self.dirty = true;
-                        owner.fact(Fact::Exited(id, code), &self.library)
+                        let result = owner.fact(Fact::Exited(id, code), &self.library);
+                        if owner.state.active_terminal() == Some(id)
+                            && owner
+                                .state
+                                .terminal(id)
+                                .is_some_and(|terminal| terminal.status == Status::Exited)
+                            && let Some(attached) = self
+                                .catalog
+                                .sessions
+                                .iter()
+                                .position(|known| *known == session)
+                        {
+                            let mut nui = self.projection(None);
+                            nui.attached = attached;
+                            nav::open(&mut nui);
+                            for client in &mut self.catalog.clients {
+                                if client.session == session && client.navigation.is_none() {
+                                    client.navigation = nui.navigation.clone();
+                                }
+                            }
+                        }
+                        result
                     } else {
                         Ok(())
                     }
@@ -1061,7 +1082,7 @@ impl App {
                 };
                 render
                     .terminal
-                    .draw(|frame| ui::view(frame, &nui, &screens, &scene, &decoration))
+                    .draw(|frame| ui::view(frame, &nui, &screens, &scene))
             };
             let notice = plugins.take_notices().pop();
             if let Some(notice) = notice {

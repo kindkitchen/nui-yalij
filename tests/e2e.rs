@@ -826,6 +826,128 @@ fn repl_completes_then_requires_explicit_yes_even_with_apply() {
 }
 
 #[test]
+fn terminal_exits_open_navigation_but_nested_shells_and_commands_do_not() {
+    let home = Home::new("exit-navigation");
+    let mut tui = Tui::start(&home, &[]);
+    tui.prompt();
+    let original = home.pid(1, 1).unwrap();
+
+    tui.send("PS1='nested> ' /bin/sh\r");
+    tui.wait("nested shell", |tui| {
+        tui.rows().iter().any(|row| row.starts_with("nested>"))
+    });
+    tui.send("exit\r");
+    tui.wait("outer shell", |tui| tui.text().trim_end().ends_with('$'));
+    tui.view();
+    assert_eq!(home.pid(1, 1), Some(original));
+    tui.send("/bin/sh -c 'exit 9'; printf 'command-returned\\n'\r");
+    tui.wait("command returned", |tui| {
+        tui.rows()
+            .iter()
+            .any(|row| row.trim_end() == "command-returned")
+    });
+    tui.view();
+    assert_eq!(home.pid(1, 1), Some(original));
+
+    for (ending, code) in [
+        ("exit\r", Some(0)),
+        ("\x04", Some(0)),
+        ("exit 5\r", Some(5)),
+        ("kill -KILL $$\r", None),
+    ] {
+        let pid = home.pid(1, 1).unwrap();
+        tui.send("printf 'retained-output\\n'\r");
+        tui.wait("output before exit", |tui| {
+            tui.rows()
+                .iter()
+                .any(|row| row.trim_end() == "retained-output")
+        });
+        tui.send(ending);
+        tui.text_is(" native ");
+        home.wait("terminal exit persisted", || {
+            let state = home.read(1);
+            state.contains("status=exited")
+                && home.pid(1, 1).is_none()
+                && code.is_none_or(|code| state.contains(&format!("exit={code}")))
+        });
+        tui.wait("exited terminal kept below navigation", |tui| {
+            tui.rows()
+                .iter()
+                .skip(ROWS as usize / 2 + 1)
+                .any(|row| row.contains("retained-output"))
+        });
+        assert!(!tui.text().contains(": restart"), "{}", tui.text());
+        tui.send("\r");
+        tui.view();
+        tui.prompt();
+        home.wait("enter restarts the terminal", || {
+            home.pid(1, 1).is_some_and(|next| next != pid)
+        });
+    }
+    tui.detach("\x14");
+}
+
+#[test]
+fn terminal_exits_only_move_focused_viewers_and_leave_navigation_alone() {
+    let home = Home::new("exit-viewers");
+    home.write(&home.global(), "session main { terminal 1 command=\"/bin/sh\"; terminal 2 command=\"/bin/sh\"; workspace { window { pane one terminal=1; pane two terminal=2 } } }");
+    let mut a = Tui::start(&home, &[]);
+    a.prompt();
+    let mut b = Tui::start(&home, &["attach", "main"]);
+    b.prompt();
+    b.send("\x14]");
+    b.text_is(" native ");
+    b.send("\x1b");
+    b.view();
+    let mut browser = Tui::start(&home, &["attach", "main"]);
+    browser.prompt();
+    browser.send("\x14jr");
+    browser.text_is("Rename:");
+    browser.send("draft");
+    browser.text_is("twodraft");
+    let mut other = Tui::start(&home, &["attach", "other"]);
+    other.prompt();
+    let other_pid = home.pid(2, 1).unwrap();
+
+    // An inactive pane ending must not pull viewers out of the running pane.
+    let background = home.pid(1, 2).unwrap();
+    assert_eq!(unsafe { libc::kill(background as i32, libc::SIGKILL) }, 0);
+    home.wait("inactive terminal exited", || home.pid(1, 2).is_none());
+    a.view();
+    b.view();
+    browser.text_is("twodraft");
+
+    a.send("exit\r");
+    a.text_is(" native ");
+    b.text_is(" native ");
+    // The automatically opened panel keeps each viewer's representation.
+    home.wait("fs representation retained", || {
+        fs::read_to_string(home.global())
+            .unwrap()
+            .contains("representation=fs")
+    });
+    browser.text_is("Rename:");
+    browser.text_is("twodraft");
+    other.view();
+    assert_eq!(home.pid(2, 1), Some(other_pid));
+    other.send("printf 'still-running\\n'\r");
+    other.wait("other session still interactive", |tui| {
+        tui.rows()
+            .iter()
+            .any(|row| row.trim_end() == "still-running")
+    });
+
+    a.send("q");
+    a.exited();
+    b.send("q");
+    b.exited();
+    browser.send("\x1b");
+    browser.send("q");
+    browser.exited();
+    other.detach("\x14");
+}
+
+#[test]
 fn shutdown_restarts_from_independent_session_states() {
     let home = Home::new("restart");
     let mut a = Tui::start(&home, &["attach", "main"]);
@@ -854,6 +976,8 @@ fn shutdown_restarts_from_independent_session_states() {
     assert_eq!(unsafe { libc::kill(second as i32, 0) }, -1);
 
     let mut again = Tui::start(&home, &["attach", "main"]);
+    again.wait("client ready", |tui| tui.raw().contains("\x1b[?1049h"));
+    again.send("\x14");
     again.text_is("exited with 5");
     let mut other = Tui::start(&home, &["attach", "other"]);
     other.prompt();

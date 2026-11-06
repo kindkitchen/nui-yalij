@@ -48,17 +48,11 @@ fn hints(d: &Decoration, representation: StateRepresentation) -> String {
 
 /// The view: the scene of the attached session, with the cursor of the
 /// focused pane.
-pub fn view(
-    frame: &mut Frame,
-    nui: &Nui,
-    runtime: &impl Screens,
-    scene: &Scene,
-    decoration: &Decoration,
-) {
+pub fn view(frame: &mut Frame, nui: &Nui, runtime: &impl Screens, scene: &Scene) {
     let here = nui.location();
     for shown in &scene.panes {
         let focused = Some(shown.at) == here;
-        let cursor = pane(frame.buffer_mut(), nui, runtime, shown, focused, decoration);
+        let cursor = pane(frame.buffer_mut(), nui, runtime, shown);
         if let Some(cursor) = cursor.filter(|_| focused) {
             frame.set_cursor_position(cursor);
         }
@@ -294,7 +288,7 @@ fn screen(
         && !area.is_empty()
     {
         let shown = Shown { at, terminal, area };
-        pane(buffer, nui, runtime, &shown, false, decoration);
+        pane(buffer, nui, runtime, &shown);
     }
 }
 
@@ -333,7 +327,7 @@ fn origin(
     };
     if let Some(terminal) = nui.pane(at).map(|pane| pane.terminal) {
         let shown = Shown { at, terminal, area };
-        pane(buffer, nui, runtime, &shown, false, decoration);
+        pane(buffer, nui, runtime, &shown);
     }
 }
 
@@ -686,49 +680,18 @@ fn popup_block<'a>(title: &'a str, theme: &Theme) -> Block<'a> {
         .title(title)
 }
 
-/// A pane: the screen of its terminal, with a badge when it doesn't run,
-/// telling what to do in the focused one. Returns the cursor of the terminal,
-/// when in sight.
-fn pane(
-    buffer: &mut Buffer,
-    nui: &Nui,
-    runtime: &impl Screens,
-    shown: &Shown,
-    focused: bool,
-    decoration: &Decoration,
-) -> Option<Position> {
+/// A pane: the screen of its terminal, dimmed when it doesn't run.
+/// Returns the cursor of a running terminal, when in sight.
+fn pane(buffer: &mut Buffer, nui: &Nui, runtime: &impl Screens, shown: &Shown) -> Option<Position> {
     let terminal = nui.shown(shown.at)?;
     let running = terminal.status == Status::Running;
-    let cursor = runtime
+    runtime
         .screen_at(shown.at.session, terminal.id)
         .and_then(|screen| {
             let parser = lock(screen);
             let cursor = draw_screen(buffer, shown.area, parser.screen(), !running);
             cursor.filter(|_| running && !parser.screen().hide_cursor())
-        });
-    if !running {
-        let (text, color) = status(terminal, &decoration.theme);
-        let hint = if focused {
-            format!(
-                " · {}: restart · {}: panel",
-                decoration.hint("restart"),
-                decoration.hint("panel")
-            )
-        } else {
-            String::new()
-        };
-        let badge = format!(" {} {text}{hint} ", terminal.program_name());
-        let width = Line::raw(badge.as_str()).width() as u16;
-        let x = shown.area.right().saturating_sub(width).max(shown.area.x);
-        buffer.set_stringn(
-            x,
-            shown.area.y,
-            badge,
-            shown.area.width as usize,
-            Style::new().black().bg(color),
-        );
-    }
-    cursor
+        })
 }
 
 /// How a terminal is, in words and color: an exit is an error only with a
@@ -1018,17 +981,19 @@ mod tests {
     }
 
     #[test]
-    fn a_badge_tells_what_happened_and_what_to_do() {
+    fn stopped_and_exited_panes_show_status_only_in_navigation() {
         let (events, _) = std::sync::mpsc::channel();
         let runtime = Runtime::new(events, (24, 80));
         let mut nui = sample();
         let area = Rect::new(0, 0, 80, 3);
-        for (exit, badge) in [
-            (0, " sh exited · enter: restart · ctrl-t: panel "),
-            (2, " sh exited with 2 · "),
+        for (status, exit, text) in [
+            (Status::Stopped, None, "stopped"),
+            (Status::Exited, Some(0), "exited"),
+            (Status::Exited, Some(2), "exited with 2"),
+            (Status::Exited, None, "failed to start"),
         ] {
             let shown = &mut nui.sessions[0].terminals[0];
-            (shown.status, shown.exit) = (Status::Exited, Some(exit));
+            (shown.status, shown.exit) = (status, exit);
             let scene = layout::scene(
                 &nui,
                 Level::Session,
@@ -1038,12 +1003,19 @@ mod tests {
             );
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
             terminal
-                .draw(|frame| view(frame, &nui, &runtime, &scene, &Decoration::default()))
+                .draw(|frame| view(frame, &nui, &runtime, &scene))
                 .unwrap();
-            let top: String = (0..area.width)
-                .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
-                .collect();
-            assert!(top.contains(badge), "{top}");
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .all(|cell| cell.symbol() == " ")
+            );
+            crate::nav::open(&mut nui);
+            let (_, rows) = draw(&nui, &Decoration::default(), 200, 12);
+            assert!(rows.iter().any(|row| row.contains(text)), "{rows:?}");
         }
     }
 }

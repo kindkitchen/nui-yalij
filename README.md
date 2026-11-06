@@ -110,6 +110,13 @@ level; esc keeps the remaining automatic names (`workspace-2`, `window-1`, etc.)
 Removing cascades through empty containers and drops terminals no pane shows
 anymore. Stopping keeps structure; enter restarts the terminal.
 
+When the focused terminal's process exits, navigation opens for its viewers:
+`exit`, EOF (`ctrl-d`), nonzero exits and signals all work the same way. Exiting
+a nested shell or finishing a command inside a live shell does not switch views.
+Existing navigation and viewers of other terminals are left alone. The terminal's
+screen stays unobstructed; stopped/exited status is shown in navigation, where
+enter restarts the hovered pane's terminal.
+
 ## Navigation: representations of the state
 
 Navigation shows a **representation** of the state: a mapping of it into
