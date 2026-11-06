@@ -1,4 +1,4 @@
-# v0.1.0-nui-yalij
+# nui-yalij
 
 The first variant of nui: **ya**zi + ze**lij**. A terminal multiplexer derived
 from authoritative KDL state. Processes, layouts and navigation follow state;
