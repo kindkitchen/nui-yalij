@@ -15,6 +15,7 @@ mod ipc;
 mod kdl;
 mod keys;
 mod layout;
+mod lifecycle;
 mod nav;
 mod plugin;
 mod runtime;

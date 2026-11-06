@@ -2,8 +2,19 @@
 name = "nui-yalij"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 description = "Shared terminal sessions driven by KDL state and layered decoration"
+license = "MIT"
+repository = "https://github.com/kindkitchen/nui-yalij"
+readme = "README.md"
+keywords = ["terminal", "multiplexer", "tui"]
+categories = ["command-line-utilities"]
+include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/**", "tests/**", "plugins/**"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/nui-yalij-{ version }/{ name }-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }"
 
 [dependencies]
 crossterm = { version = "0.29", features = ["serde"] }

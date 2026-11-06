@@ -5,11 +5,64 @@ from authoritative KDL state. Processes, layouts and navigation follow state;
 runtime observations enter it as facts. Configuration lives separately, as
 **decoration**.
 
-Requires Unix (macOS/Linux) and Rust 1.89+.
+Requires Unix (macOS/Linux). Building from source requires Rust 1.95+ and a C
+compiler for vendored Lua. Licensed under [MIT](LICENSE).
+
+## Install, update, uninstall
+
+Install from crates.io, or use Binstall for the matching GitHub Release binary:
+
+```nu
+cargo install nui-yalij --locked
+# Alternative, with cargo-binstall installed:
+cargo binstall nui-yalij
+nui-yalij --version
+```
+
+Both use Cargo's bin directory, normally `~/.cargo/bin`; it must be on `PATH`.
+For an unreleased checkout, use `cargo install --path . --locked` instead.
+
+Lifecycle commands **observe by default**; `--apply` performs the operation:
+
+```nu
+nui-yalij update                  # Show the plan
+nui-yalij update --apply          # Install latest, then stop old servers
+nui-yalij update 0.2.0 --apply     # Or install an exact version
+nui-yalij uninstall               # List everything that will be wiped
+nui-yalij uninstall --apply       # Stop servers, remove the binary and wipe data
+```
+
+Run these **outside nui-yalij panes**. Update uses `cargo install --locked --force`;
+it verifies the replacement before stopping old servers. Failed installation
+leaves the old servers running. Configuration and persisted session structure
+stay; running programs stop, and the next attachment starts the new server.
+
+**Uninstall is destructive, with no retained settings or backup.** It stops all
+servers in the current user's runtime locations, unregisters the managed Cargo
+executable, and removes the app's state, sessions, configuration, logs, cache,
+legacy files and sockets from the current XDG and default home locations.
+Custom state/configuration must be supplied explicitly:
+
+```nu
+nui-yalij --state /path/global.kdl --config /path/app-config uninstall
+nui-yalij --state /path/global.kdl --config /path/app-config uninstall --apply
+```
+
+Only that custom catalog's files/sidecars and the dedicated custom config
+directory are wiped, not their parent folders. Other custom locations are not
+guessed; external plugins, source checkouts, and shared Rust/Cargo caches remain.
+Directory symlinks are removed rather than followed. Protected home/source
+folders are refused. `remove` is an alias for `uninstall`.
+
+`install [<version>] --apply` also works from an uninstalled development binary;
+it refuses to overwrite an existing managed installation (use `update`). The
+managed install root is `CARGO_INSTALL_ROOT`, then `CARGO_HOME`, then `~/.cargo`.
+If you installed with a custom `cargo --root`, set `CARGO_INSTALL_ROOT` to that
+same directory before lifecycle operations.
 
 ## Run
 
-No installation or PATH registration needed:
+Without installing, run directly from the checkout:
 
 ```nu
 cargo run --release -- attach main
@@ -71,11 +124,6 @@ exist nowhere else. A shell alias or function of the same name shadows them.
 completed command is shown before `Apply? (N/y)`. Only lowercase `y` executes.
 Even a supplied `--apply` does not bypass this confirmation. Cancellation never
 starts a daemon or writes state.
-
-**Installation is deferred:** `install`, `update` and `remove` only explain that
-they will be implemented when the application reaches a more stable release.
-They make no changes, including with `--apply`. No installer/download script or
-partial uninstall is provided yet.
 
 ## Primitives and keys
 
@@ -358,11 +406,61 @@ Helpers on global `nui`: `shell`, `next_id(state)`, `remove(state, level, locati
 Put it in global/session decoration to enable that automatic cleanup, not just
 a profile.
 
+## Versioning and releases
+
+The project-local `justfile` requires `just` and Nushell. Version commands require
+a clean `nui-yalij/main` whose HEAD matches `origin`:
+
+```nu
+just check                            # Tests, lint, helper tests, package dry-run
+just version patch                    # Preview only; no Git or file writes
+just version minor --apply            # Bump, validate, commit, annotate a local tag
+just version major --apply --release  # Also push and publish the GitHub Release
+```
+
+Patch increments the last component; minor resets patch; major resets both.
+Only this package's versions in `Cargo.toml` and `Cargo.lock` change. A failed
+validation restores those files. Dependency versions stay locked. The resulting
+tag is `nui-yalij-<version>`. `--apply` alone never pushes or publishes.
+
+To publish an already prepared local version:
+
+```nu
+let tag = $"nui-yalij-((open Cargo.toml).package.version)"
+git push --atomic origin HEAD:refs/heads/nui-yalij/main $"refs/tags/($tag)"
+gh release create $tag --repo kindkitchen/nui-yalij --verify-tag --title $tag --generate-notes --latest
+```
+
+**Publishing a GitHub Release is the only release trigger**, not pushing a tag.
+The pipeline checks tests/lint/package contents and the Rust 1.95 minimum, then
+builds native Apple Silicon macOS, Intel macOS, and x86-64 Linux archives. It
+smoke-tests their version/help, attaches all archives plus `SHA256SUMS`, and only
+then publishes the matching source crate to crates.io. Version, tag, archive
+names and Binstall metadata must agree. Linux builds use Ubuntu 22.04/glibc 2.35;
+macOS binaries target macOS 13+. Windows and Linux ARM binaries are not provided.
+
+Set the repository's `CARGO_REGISTRY_TOKEN` Actions secret to a crates.io token
+with publish rights for this crate; never commit credentials or `.env`. The
+workflow has no automatic crates.io fallback outside the release job. After the
+first publish, crates.io Trusted Publishing is an alternative to a stored token.
+Published crate versions cannot be overwritten. If a job fails, rerun **failed
+jobs**, not a successful release's entire workflow; existing assets are not
+silently replaced. Do not update your installation until the release completes.
+
+To check that Binstall actually uses your binaries rather than a third-party
+host or compilation fallback:
+
+```nu
+cargo binstall nui-yalij --strategies crate-meta-data
+```
+
 ## Checks and limits
 
 ```nu
-cargo test --all-targets
-cargo clippy --all-targets -- -D warnings
+just check
+# Application checks alone:
+cargo test --locked --all-targets -- --test-threads=1
+cargo clippy --locked --all-targets -- -D warnings
 ```
 
 Tests include real multi-client PTYs, same/different sessions, foreign-session

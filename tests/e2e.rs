@@ -1048,12 +1048,12 @@ fn deleting_one_client_node_disconnects_only_that_instance() {
 }
 
 #[test]
-fn lifecycle_commands_are_honest_read_only_placeholders() {
-    let home = Home::new("lifecycle");
-    for command in ["install", "update", "remove"] {
-        let output = home.ok(&[command, "--apply"]);
-        assert!(output.contains("more stable release") && output.contains("No changes made."));
-    }
+fn listing_and_invalid_options_do_not_create_state() {
+    let home = Home::new("listing");
+    assert_eq!(
+        home.ok(&["--version"]).trim(),
+        format!("nui-yalij {}", env!("CARGO_PKG_VERSION"))
+    );
     assert!(!home.global().exists());
     assert!(!home.config().exists());
     assert!(home.ok(&["list"]).is_empty());

@@ -18,7 +18,7 @@ use crate::{
     app, client,
     global::{self, Catalog},
     ipc::Request,
-    session,
+    lifecycle, session,
     state::Session,
 };
 
@@ -37,10 +37,11 @@ commands:
   reload             reload global/profile decoration and plugin files
   kill [--apply]     observe, or stop this catalog's servers and all its clients
   server             host the session servers in the foreground
-  install            placeholder until a more stable release
-  update             placeholder until a more stable release
-  remove             placeholder until a more stable release
+  install [<version>] [--apply] install the latest/requested crate with Cargo
+  update [<version>] [--apply]  replace the managed binary; preserve data, stop old servers
+  uninstall [--apply] wipe the managed binary and app data; remove is an alias
   help               show this help
+  --version          show the executable version
 
 --repl completes a command interactively (arrows or j/k, enter, esc), then
 asks Apply? (N/y). Nothing executes before y, even with --apply.
@@ -51,8 +52,19 @@ instance; active windows/panes are shared state. ctrl-t, or t inside a pane,
 opens navigation: q disconnects only this instance; Q stops this catalog's servers.
 ";
 
-const COMMANDS: [&str; 10] = [
-    "attach", "call", "list", "reload", "kill", "server", "install", "update", "remove", "help",
+const COMMANDS: [&str; 12] = [
+    "attach",
+    "call",
+    "list",
+    "reload",
+    "kill",
+    "server",
+    "install",
+    "update",
+    "uninstall",
+    "remove",
+    "help",
+    "version",
 ];
 
 pub struct Options {
@@ -156,6 +168,10 @@ impl Options {
                 }
                 "--repl" if inline.is_none() => options.repl = true,
                 "--apply" if inline.is_none() => options.apply = true,
+                "-V" | "--version" => {
+                    options.words = vec!["version".into()];
+                    return Ok(options);
+                }
                 "-h" | "--help" => {
                     options.words = vec!["help".into()];
                     return Ok(options);
@@ -164,8 +180,16 @@ impl Options {
                 _ => options.words.push(arg),
             }
         }
-        options.state = absolute(&options.state)?;
-        options.config = absolute(&options.config)?;
+        if matches!(
+            options.words.first().map(String::as_str),
+            Some("install" | "update" | "uninstall" | "remove")
+        ) {
+            options.state = lifecycle::path(&options.state)?;
+            options.config = lifecycle::path(&options.config)?;
+        } else {
+            options.state = absolute(&options.state)?;
+            options.config = absolute(&options.config)?;
+        }
         if options
             .profile
             .as_ref()
@@ -185,7 +209,7 @@ impl Options {
             return Err(format!("unknown command {command}; use help"));
         }
         let (minimum, maximum) = match command {
-            "attach" => (1, 2),
+            "attach" | "install" | "update" => (1, 2),
             "call" => (2, 2),
             _ => (1, 1),
         };
@@ -268,9 +292,8 @@ pub fn run(mut options: Options) -> Result<(), String> {
         .unwrap_or("attach");
     match command {
         "help" => print!("{USAGE}"),
-        "install" | "update" | "remove" => println!(
-            "nui-yalij: {command} will be implemented when the application reaches a more stable release. No changes made."
-        ),
+        "version" => println!("nui-yalij {}", env!("CARGO_PKG_VERSION")),
+        "install" | "update" | "uninstall" | "remove" => return lifecycle::run(command, &options),
         "server" => {
             return crate::server::serve(
                 options.state.clone(),
@@ -394,7 +417,10 @@ fn complete(options: &mut Options) -> Result<bool, String> {
             .map(|word| format!("{word:?}"))
             .collect::<Vec<_>>()
             .join(" "),
-        if options.words[0] == "kill" {
+        if matches!(
+            options.words[0].as_str(),
+            "kill" | "install" | "update" | "uninstall" | "remove"
+        ) {
             " --apply"
         } else {
             ""
@@ -402,6 +428,8 @@ fn complete(options: &mut Options) -> Result<bool, String> {
     );
     if options.words[0] == "kill" {
         println!("Stops every session server and connected instance in this catalog.");
+    } else if matches!(options.words[0].as_str(), "uninstall" | "remove") {
+        println!("Permanently wipes the managed executable, configuration, sessions and app data.");
     }
     let answer = prompt("Apply? (N/y) ")?;
     if answer != "y" {

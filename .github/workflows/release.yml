@@ -1,0 +1,109 @@
+name: Release
+
+# Publishing a GitHub Release, not pushing a tag, is the only release trigger.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: nu {0}
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: checks
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: hustcer/setup-nu@eacad52a4634c4f8d17a94916f93be6856861b9c # v3.29
+        with:
+          version: "0.116.0"
+      - name: Install the pinned release toolchain
+        run: rustup toolchain install 1.95.0 --profile minimal --target $env.TARGET
+      - name: Verify version, build, smoke-test and archive
+        env:
+          RUSTUP_TOOLCHAIN: "1.95.0"
+        run: nu release/package.nu $env.TARGET $env.RELEASE_TAG
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: target/release-dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  assets:
+    name: Attach verified release assets
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: hustcer/setup-nu@eacad52a4634c4f8d17a94916f93be6856861b9c # v3.29
+        with:
+          version: "0.116.0"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums and attach archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          let files = glob dist/*.tar.gz | sort
+          if ($files | length) != 3 { error make {msg: "expected all three platform archives"} }
+          let checksums = ($files | each {|file| $"(open --raw $file | hash sha256)  ($file | path basename)" } | str join (char nl)) + (char nl)
+          $checksums | save dist/SHA256SUMS
+          gh release upload $env.RELEASE_TAG ...$files dist/SHA256SUMS
+
+  publish:
+    name: Publish crate after all release assets exist
+    needs: assets
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+      - uses: hustcer/setup-nu@eacad52a4634c4f8d17a94916f93be6856861b9c # v3.29
+        with:
+          version: "0.116.0"
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Publish matching source package
+        env:
+          RUSTUP_TOOLCHAIN: "1.95.0"
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: nu release/publish.nu $env.RELEASE_TAG

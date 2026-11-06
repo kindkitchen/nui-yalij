@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ["nui-yalij/**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: nu {0}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hustcer/setup-nu@eacad52a4634c4f8d17a94916f93be6856861b9c # v3.29
+        with:
+          version: "0.116.0"
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2
+        with:
+          tool: just@1.59.0
+          fallback: none
+      - name: Install Rust tooling
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+      - name: Validate application, release commands and source package
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: nu release/check.nu
+
+  minimum:
+    name: Rust 1.95 minimum
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hustcer/setup-nu@eacad52a4634c4f8d17a94916f93be6856861b9c # v3.29
+        with:
+          version: "0.116.0"
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: cargo +1.95.0 check --locked --all-targets
