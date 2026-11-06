@@ -422,12 +422,14 @@ Patch increments the last component; minor resets patch; major resets both.
 Only this package's versions in `Cargo.toml` and `Cargo.lock` change. A failed
 validation restores those files. Dependency versions stay locked. The resulting
 tag is `nui-yalij-<version>`. `--apply` alone never pushes or publishes.
+`--release` requires this project's GitHub origin and uses `gh`'s active account
+for the push and release, without changing global Git credentials.
 
 To publish an already prepared local version:
 
 ```nu
 let tag = $"nui-yalij-((open Cargo.toml).package.version)"
-git push --atomic origin HEAD:refs/heads/nui-yalij/main $"refs/tags/($tag)"
+git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push --atomic origin HEAD:refs/heads/nui-yalij/main $"refs/tags/($tag)"
 gh release create $tag --repo kindkitchen/nui-yalij --verify-tag --title $tag --generate-notes --latest
 ```
 

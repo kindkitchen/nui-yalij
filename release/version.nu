@@ -35,7 +35,13 @@ def main [
     }
     let from = $"name = \"nui-yalij\"\nversion = \"($old)\""
     if not ($lock | str contains $from) { error make --unspanned {msg: "Cargo.lock does not match the package version"} }
-    if $release { checked gh auth status | ignore }
+    if $release {
+        let origin = checked git remote get-url origin
+        if $origin not-in ['https://github.com/kindkitchen/nui-yalij.git' 'https://github.com/kindkitchen/nui-yalij' 'git@github.com:kindkitchen/nui-yalij.git'] {
+            error make --unspanned {msg: 'release origin must be kindkitchen/nui-yalij'}
+        }
+        checked gh auth status | ignore
+    }
     print $"($old) -> ($next): Cargo.toml, Cargo.lock; validate; commit; tag ($tag)."
     if $release { print 'Then atomically push branch/tag and publish the GitHub Release.' }
     if not $apply { print 'Observed only; add --apply to make these changes.'; return }
@@ -54,7 +60,7 @@ def main [
     checked git commit -m $"release ($tag)"
     checked git tag --annotate $tag --message $tag
     if $release {
-        checked git push --atomic origin $"HEAD:refs/heads/($branch)" $"refs/tags/($tag)"
+        checked git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push --atomic origin $"HEAD:refs/heads/($branch)" $"refs/tags/($tag)"
         checked gh release create $tag --repo kindkitchen/nui-yalij --verify-tag --title $tag --generate-notes --latest
     } else {
         print $"Prepared locally. Publish ($tag) as a GitHub Release when ready; no remote writes made."
