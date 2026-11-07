@@ -1117,7 +1117,9 @@ fn escape_gestures_are_per_instance_use_reports_or_repeats_and_can_be_disabled()
     let mut quiet = Tui::start(&home, &["--profile", "quiet"]);
     quiet.prompt();
     tui.send("\x1b\x1b");
-    tui.text_is(" native ");
+    tui.wait("legacy double Escape opens navigation", |tui| {
+        tui.text().contains(" native ")
+    });
     assert!(!quiet.text().contains(" native "));
     tui.send("\x14");
     tui.view();
@@ -1135,11 +1137,16 @@ fn escape_gestures_are_per_instance_use_reports_or_repeats_and_can_be_disabled()
     thread::sleep(Duration::from_millis(750));
     assert!(!tui.text().contains(" native "));
     tui.send("\x1b[27u\x1b[27;1:3u\x1b[27u\x1b[27;1:3u");
-    tui.text_is(" native ");
+    tui.wait("reported double Escape opens navigation", |tui| {
+        tui.text().contains(" native ")
+    });
     tui.send("\x14");
     tui.view();
     tui.send("\x1b[27u");
-    tui.text_is(" native "); // Timer, without any repeat event.
+    tui.wait(
+        "reported hold opens navigation without repeat events",
+        |tui| tui.text().contains(" native "),
+    );
     tui.send("\x1b[27;1:2u\x1b[27;1:2u");
     assert!(
         tui.text().contains(" native "),
@@ -1159,11 +1166,16 @@ fn escape_gestures_are_per_instance_use_reports_or_repeats_and_can_be_disabled()
     repeat.prompt();
     repeat.send("\x1b");
     thread::sleep(Duration::from_millis(400));
-    repeat.send("\x1b");
-    repeat.send("\x1b");
-    repeat.text_is(" native ");
-    repeat.send("\x1b");
-    assert!(repeat.text().contains(" native "));
+    // A held key repeats until release, not just twice. Keep sending until
+    // the panel opens so a single busy-runner scheduling gap cannot end the
+    // simulated hold before its threshold.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !repeat.text().contains(" native ") && Instant::now() < deadline {
+        repeat.send("\x1b");
+    }
+    repeat.wait("legacy hold opens navigation during auto-repeat", |tui| {
+        tui.text().contains(" native ")
+    });
     repeat.send("\x14");
     repeat.view();
 
