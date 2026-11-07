@@ -3,9 +3,11 @@
 //!
 //! It asks the terminal around it for what programs inside may ask of their
 //! terminal: keys told apart (kitty's escape codes, or xterm's
-//! modifyOtherKeys), focus, the colors and their scheme.
+//! modifyOtherKeys), focus, the colors and their scheme. It draws on the
+//! screen the terminal watched shows, the main one keeping its history.
 
 use std::{
+    ffi::CStr,
     fs::OpenOptions,
     io::{self, Write},
     os::{
@@ -25,8 +27,7 @@ use std::{
 use crossterm::{
     cursor::Show,
     event::{DisableBracketedPaste, EnableBracketedPaste, Event},
-    execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    execute, terminal,
 };
 
 use crate::{
@@ -44,11 +45,17 @@ const SETUP: &[u8] = b"\x1b[22;2t\x1b[>7u\x1b[?1004h\x1b[?2031h";
 const TEARDOWN: &[u8] = b"\x1b[<u\x1b[?1004l\x1b[?2031l\x1b[23;2t";
 const MODIFY_OTHER_KEYS: &[u8] = b"\x1b[>4;2m";
 const MODIFY_OTHER_KEYS_OFF: &[u8] = b"\x1b[>4;0m";
+/// The screens of the terminal around: the alternate one keeps keys of its
+/// own, told apart there too.
+const ALTERNATE_SCREEN: &[u8] = b"\x1b[?1049h\x1b[>7u";
+const MAIN_SCREEN: &[u8] = b"\x1b[<u\x1b[?1049l";
 /// How long an escape waits to be the start of a sequence.
 const ESCAPE: Duration = Duration::from_millis(25);
 
 /// Whether modifyOtherKeys was asked for, the terminal around lacking kitty's.
 static MODIFYING: AtomicBool = AtomicBool::new(false);
+/// Whether the terminal around shows its alternate screen.
+static ALTERNATE: AtomicBool = AtomicBool::new(false);
 /// Where the handler of resizes writes, waking the reader of input.
 static RESIZED: AtomicI32 = AtomicI32::new(-1);
 
@@ -153,13 +160,14 @@ pub fn control(mut stream: UnixStream, request: Request) -> Result<String, Strin
 
 struct TerminalGuard;
 impl TerminalGuard {
-    fn enter() -> Result<Self, String> {
+    fn enter(rows: u16) -> Result<Self, String> {
         terminal::enable_raw_mode().map_err(|error| error.to_string())?;
         let guard = TerminalGuard;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)
-            .map_err(|error| error.to_string())?;
-        // on the alternate screen, so leaving it gives the keys back too
-        let mut questions = SETUP.to_vec();
+        execute!(io::stdout(), EnableBracketedPaste).map_err(|error| error.to_string())?;
+        // what the screen shows above the cursor goes up into the history,
+        // as more output would push it
+        let mut questions = vec![b'\n'; usize::from(rows.saturating_sub(1))];
+        questions.extend(SETUP);
         questions.extend(b"\x1b[?u\x1b[?996n");
         questions.extend(colors());
         tell(&questions);
@@ -168,18 +176,31 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if ALTERNATE.swap(false, Ordering::Relaxed) {
+            tell(MAIN_SCREEN);
+        }
         tell(TEARDOWN);
         if MODIFYING.load(Ordering::Relaxed) {
             tell(MODIFY_OTHER_KEYS_OFF);
         }
-        let _ = execute!(
-            io::stdout(),
-            Show,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        // the history stays, the drawing goes
+        tell(ipc::CLEAR);
+        let _ = execute!(io::stdout(), Show, DisableBracketedPaste);
         let _ = terminal::disable_raw_mode();
     }
+}
+
+/// The tty of the terminal around.
+fn tty() -> Option<String> {
+    let mut name = [0 as libc::c_char; 256];
+    // SAFETY: ttyname_r writes a NUL-terminated name into the buffer it is told.
+    let failed = unsafe { libc::ttyname_r(libc::STDOUT_FILENO, name.as_mut_ptr(), name.len()) };
+    // SAFETY: on success the buffer holds a NUL-terminated string.
+    (failed == 0).then(|| {
+        unsafe { CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    })
 }
 
 /// A pipe the handler of SIGWINCH writes to; its end to read.
@@ -328,6 +349,7 @@ pub fn attach(
             .ok()
             .map(|path| path.display().to_string()),
         size: (rows, cols),
+        tty: tty(),
     };
     ipc::send(&mut stream, &request).map_err(|error| error.to_string())?;
     match ipc::receive(&mut stream).map_err(|error| error.to_string())? {
@@ -335,7 +357,7 @@ pub fn attach(
         Response::Result(Err(error)) => return Err(error),
         _ => return Err("unexpected attach response (old server?)".into()),
     }
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(rows)?;
     crate::server::signals();
     let resized = resizes()?;
     let input = stream.try_clone().map_err(|error| error.to_string())?;
@@ -358,6 +380,15 @@ pub fn attach(
                 out.write_all(&bytes)
                     .and_then(|()| out.flush())
                     .map_err(|error| error.to_string())?;
+            }
+            Ok(Response::Screen(alternate)) => {
+                if ALTERNATE.swap(alternate, Ordering::Relaxed) != alternate {
+                    tell(if alternate {
+                        ALTERNATE_SCREEN
+                    } else {
+                        MAIN_SCREEN
+                    });
+                }
             }
             Ok(Response::Closed) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
             Ok(Response::Result(Err(error))) => return Err(error),

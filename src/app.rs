@@ -21,7 +21,7 @@ use crate::{
     layout::{self, Container},
     nav,
     plugin::{ClientContext, Plugins},
-    runtime::{Effect, Palette, Screen, Screens, lock},
+    runtime::{Effect, Mark, Palette, Screen, Screens, lock},
     session::SessionServer,
     state::{Fact, Level, Location, Nui, Session, StateRepresentation, Status},
     store::{Store, suffixed},
@@ -50,6 +50,9 @@ pub struct App {
     last_input: HashMap<(u64, u64), u64>,
     /// The terminals around connected clients, as far as programs reach them.
     outer: HashMap<u64, Outer>,
+    /// What the terminals around detached clients have of the histories, by
+    /// tty, for when they attach again.
+    seen: HashMap<String, Seen>,
     /// The terminals focused: in the focused pane of an instance whose
     /// terminal has the focus, by session and terminal id.
     focused: HashSet<(u64, u64)>,
@@ -71,7 +74,15 @@ struct Outer {
     title: Option<String>,
     /// Bytes to pass on with the next drawing.
     bytes: Vec<u8>,
+    /// Its tty, telling it from others across attachments.
+    tty: Option<String>,
+    /// What it has of the histories of the terminals it watched.
+    seen: Seen,
 }
+
+/// How far a terminal around has the history of each terminal, by session
+/// and terminal id.
+type Seen = HashMap<(u64, u64), Mark>;
 
 struct SessionScreens<'a> {
     order: &'a [u64],
@@ -171,6 +182,7 @@ impl App {
             views: HashMap::new(),
             last_input: HashMap::new(),
             outer: HashMap::new(),
+            seen: HashMap::new(),
             focused: HashSet::new(),
             events,
             shell,
@@ -276,7 +288,11 @@ impl App {
         self.catalog.clients.retain(|client| client.id != id);
         self.views.retain(|(client, _), _| *client != id);
         self.last_input.retain(|_, client| *client != id);
-        self.outer.remove(&id);
+        if let Some(outer) = self.outer.remove(&id)
+            && let Some(tty) = outer.tty
+        {
+            self.seen.insert(tty, outer.seen);
+        }
         self.dirty = true;
         self.persist();
     }
@@ -589,6 +605,7 @@ impl App {
                 config,
                 cwd,
                 size,
+                tty,
             } => {
                 if self.catalog.client(id).is_some() {
                     return Err("already attached".into());
@@ -612,6 +629,12 @@ impl App {
                     message: None,
                 });
                 self.peers.get_mut(&id).unwrap().render = Some(render);
+                let outer = self.outer.entry(id).or_default();
+                outer.seen = tty
+                    .as_ref()
+                    .and_then(|tty| self.seen.remove(tty))
+                    .unwrap_or_default();
+                outer.tty = tty;
                 self.reply(
                     id,
                     Response::Ready {
@@ -1082,6 +1105,7 @@ impl App {
         }
         self.dirty = false;
         self.focus();
+        let mut waiting = false;
         let clients: Vec<u64> = self
             .catalog
             .clients
@@ -1100,6 +1124,15 @@ impl App {
             let Ok((session, decoration)) = self.decoration(client) else {
                 continue;
             };
+            let (switched, more) = match self.watch(client, &nui, &mut render) {
+                Ok(watched) => watched,
+                Err(error) => {
+                    eprintln!("client {client}: render: {error}");
+                    self.disconnect(client);
+                    continue;
+                }
+            };
+            waiting |= more;
             let plugins = self
                 .views
                 .entry((client, session))
@@ -1116,9 +1149,7 @@ impl App {
                     order: &self.catalog.sessions,
                     owners: &self.owners,
                 };
-                render
-                    .terminal
-                    .draw(|frame| ui::navigation(frame, &nui, &screens, &decoration))
+                render.draw(|frame| ui::navigation(frame, &nui, &screens, &decoration))
             } else {
                 let root = Location {
                     session: nui.attached,
@@ -1153,9 +1184,7 @@ impl App {
                     order: &self.catalog.sessions,
                     owners: &self.owners,
                 };
-                render
-                    .terminal
-                    .draw(|frame| ui::view(frame, &nui, &screens, &scene))
+                render.draw(|frame| ui::view(frame, &nui, &screens, &scene))
             };
             let notice = plugins.take_notices().pop();
             if let Some(notice) = notice {
@@ -1177,11 +1206,55 @@ impl App {
             if let Some(peer) = self.peers.get_mut(&client) {
                 peer.render = Some(render);
             }
+            if let Some(alternate) = switched {
+                self.reply(client, Response::Screen(alternate));
+            }
             if !bytes.is_empty() {
                 self.reply(client, Response::Frame(bytes));
             }
         }
+        // the rest of a long history goes with the next drawing
+        self.dirty |= waiting;
         self.persist();
+    }
+
+    /// Keep the terminal around an instance as the terminal it watches would
+    /// be there: on the screen it shows, with what its main screen scrolled
+    /// away in the history, so the scrolling and search of the terminal
+    /// around reach it. Returns the screen switched to, and whether more of
+    /// the history waits.
+    fn watch(
+        &mut self,
+        client: u64,
+        nui: &Nui,
+        render: &mut Render,
+    ) -> Result<(Option<bool>, bool), String> {
+        let watched = nui
+            .location()
+            .and_then(|at| Some((nui.sessions.get(at.session)?.id, nui.pane(at)?.terminal)));
+        let parser = watched
+            .and_then(|(session, terminal)| self.owners.get(&session)?.runtime.screen(terminal))
+            .map(|screen| lock(screen));
+        let alternate = parser
+            .as_ref()
+            .is_some_and(|parser| parser.screen().alternate_screen());
+        let switched = (render.alternate() != alternate).then_some(alternate);
+        if switched.is_some() {
+            render.switch(alternate)?;
+        }
+        // the alternate screen keeps no history: the rest waits for the main one
+        let (Some(parser), Some(watched), false) = (parser, watched, alternate) else {
+            return Ok((switched, false));
+        };
+        let history = &parser.callbacks().history;
+        let seen = &mut self.outer.entry(client).or_default().seen;
+        let (cleared, after, rows) = history.since(seen.get(&watched).copied());
+        if cleared {
+            render.forget();
+        }
+        let count = after + render.push(rows) as u64;
+        seen.insert(watched, history.mark(count));
+        Ok((switched, count < history.count()))
     }
 
     /// The title for the terminal around an instance: the one the program of

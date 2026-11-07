@@ -15,7 +15,12 @@ use std::{
     time::Duration,
 };
 
-use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend, layout::Rect};
+use ratatui::{
+    Frame, Terminal, TerminalOptions, Viewport,
+    backend::CrosstermBackend,
+    buffer::{Buffer, Cell},
+    layout::Rect,
+};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{
@@ -24,8 +29,14 @@ use crate::{
     store::mkdir,
 };
 
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
+/// Clears the screen without scrolling it into the history, as `CSI 2 J`
+/// does in terminals such as zellij.
+pub const CLEAR: &[u8] = b"\x1b[m\x1b[H\x1b[J";
+/// The most of a history passed on with one drawing; a longer one goes on
+/// with the next.
+const PUSHED: usize = 256 << 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -36,6 +47,10 @@ pub enum Request {
         config: PathBuf,
         cwd: Option<String>,
         size: (u16, u16),
+        /// The tty of the terminal around: attaching from it again, it has
+        /// the history passed on before.
+        #[serde(default)]
+        tty: Option<String>,
     },
     Input(crossterm::event::Event),
     /// Keyboard flags negotiated by the client; flag 2 enables precise holds.
@@ -71,6 +86,9 @@ pub enum Response {
     /// Bytes for the terminal around the client: a drawing, and what programs
     /// pass on to it, such as a copy to the clipboard.
     Frame(Vec<u8>),
+    /// The screen of the terminal around, as the terminal watched shows:
+    /// alternate or main, before the drawing on it.
+    Screen(bool),
     Result(Result<String, String>),
     Closed,
 }
@@ -150,35 +168,158 @@ impl Write for FrameWriter {
     }
 }
 
+/// Drawing in the terminal around a client. Its main screen keeps a history:
+/// the rows passed on, which its own scrolling and search reach.
 pub struct Render {
     pub terminal: Terminal<CrosstermBackend<FrameWriter>>,
     output: FrameWriter,
+    /// The size of the terminal around: rows, columns.
+    size: (u16, u16),
+    /// The drawing it shows, to scroll along with what goes into its history.
+    shown: Buffer,
+    /// It shows its alternate screen.
+    alternate: bool,
+    /// The rows passed on to its history, as far as they are known to stay.
+    history: usize,
+    /// The bytes taken next go as one synchronized update.
+    synchronized: bool,
 }
 
 impl Render {
     pub fn new(rows: u16, cols: u16) -> Result<Self, String> {
-        let output = FrameWriter::default();
-        lock(&output.0).extend_from_slice(b"\x1b[2J\x1b[H");
+        Self::open((rows, cols), CLEAR.to_vec())
+    }
+
+    /// A fixed viewport, its bytes starting with `bytes`.
+    fn open(size: (u16, u16), bytes: Vec<u8>) -> Result<Self, String> {
+        let output = FrameWriter(Arc::new(Mutex::new(bytes)));
+        let area = area(size.0, size.1);
         let terminal = Terminal::with_options(
             CrosstermBackend::new(output.clone()),
             TerminalOptions {
-                viewport: Viewport::Fixed(area(rows, cols)),
+                viewport: Viewport::Fixed(area),
             },
         )
         .map_err(|error| error.to_string())?;
-        Ok(Self { terminal, output })
+        Ok(Self {
+            terminal,
+            output,
+            size,
+            shown: Buffer::empty(area),
+            alternate: false,
+            history: 0,
+            synchronized: false,
+        })
+    }
+
+    /// Draw over all again, beginning with `bytes`, keeping what is known of
+    /// the terminal around.
+    fn reopen(&mut self, size: (u16, u16), mut bytes: Vec<u8>) -> Result<(), String> {
+        bytes.extend(CLEAR);
+        let render = Self::open(size, bytes)?;
+        *self = Self {
+            alternate: self.alternate,
+            history: self.history,
+            ..render
+        };
+        Ok(())
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
         // Terminal::resize on CrosstermBackend queries the *server\'s* TTY
         // while clearing a fixed viewport. There is no server TTY. Rebuild a
         // fixed viewport instead, and send a complete, clean frame.
-        *self = Self::new(rows, cols)?;
+        // Growing, the terminal around brings rows of its history back onto
+        // its screen: scroll them back before drawing over them.
+        let mut bytes = Vec::new();
+        if !self.alternate {
+            let back = usize::from(rows.saturating_sub(self.size.0)).min(self.history);
+            if back > 0 {
+                bytes.extend(b"\x1b[9999H");
+                bytes.resize(bytes.len() + back, b'\n');
+            }
+        }
+        self.reopen((rows, cols), bytes)
+    }
+
+    pub fn alternate(&self) -> bool {
+        self.alternate
+    }
+
+    /// Show the alternate screen or the main one, drawing it all anew.
+    pub fn switch(&mut self, alternate: bool) -> Result<(), String> {
+        self.alternate = alternate;
+        self.reopen(self.size, Vec::new())
+    }
+
+    /// The program cleared its history: so does the terminal around.
+    pub fn forget(&mut self) {
+        lock(&self.output.0).extend_from_slice(b"\x1b[3J");
+        self.history = 0;
+    }
+
+    /// Pass rows on to the history of the terminal around, as many as fit
+    /// one drawing: each is written at the top and scrolled away from the
+    /// bottom, the drawing along, so the next one draws only what is new.
+    /// Returns how many went.
+    pub fn push<'a>(&mut self, rows: impl IntoIterator<Item = &'a str>) -> usize {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut count = 0;
+        for row in rows {
+            if bytes.len() >= PUSHED {
+                break;
+            }
+            // as wide as the screen at most: a wider one would wrap
+            let row = vt100::capture::basic_formatted_rows(row, self.size.1.max(1))
+                .next()
+                .unwrap_or_default();
+            bytes.extend(b"\x1b[H\x1b[2K");
+            bytes.extend(row.as_bytes());
+            bytes.extend(b"\x1b[m\x1b[9999H\n");
+            count += 1;
+        }
+        if count == 0 {
+            return 0;
+        }
+        let mut output = lock(&self.output.0);
+        if !std::mem::replace(&mut self.synchronized, true) {
+            output.extend(b"\x1b[?2026h");
+        }
+        output.extend(b"\x1b[?25l\x1b[m");
+        output.extend(bytes);
+        drop(output);
+        self.history = self.history.saturating_add(count);
+        self.scroll(count);
+        count
+    }
+
+    /// The drawing shown went up by `rows`, blank below.
+    fn scroll(&mut self, rows: usize) {
+        let width = usize::from(self.shown.area.width);
+        let content = &mut self.shown.content;
+        let gone = rows.saturating_mul(width).min(content.len());
+        content.drain(..gone);
+        content.resize(content.len() + gone, Cell::EMPTY);
+        // what the next drawing changes
+        self.terminal
+            .current_buffer_mut()
+            .content
+            .clone_from_slice(content);
+        self.terminal.swap_buffers();
+    }
+
+    pub fn draw(&mut self, render: impl FnOnce(&mut Frame)) -> io::Result<()> {
+        let frame = self.terminal.draw(render)?;
+        self.shown.clone_from(frame.buffer);
         Ok(())
     }
 
     pub fn take(&mut self) -> Vec<u8> {
-        std::mem::take(&mut *lock(&self.output.0))
+        let mut output = lock(&self.output.0);
+        if std::mem::take(&mut self.synchronized) {
+            output.extend(b"\x1b[?2026l");
+        }
+        std::mem::take(&mut *output)
     }
 }
 
@@ -255,6 +396,109 @@ impl Drop for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::text::Text;
+
+    /// The terminal around: an emulator with a history.
+    fn around(rows: u16, cols: u16) -> vt100::Parser {
+        let size = |n| std::num::NonZeroU16::new(n).unwrap();
+        vt100::Parser::new(size(rows), size(cols), 100)
+    }
+
+    fn history(parser: &mut vt100::Parser) -> Vec<String> {
+        let rows = usize::from(parser.screen().size().0.get());
+        let (mut history, mut offset) = (Vec::new(), parser.screen().scrollback_len());
+        while offset > 0 {
+            parser.screen_mut().set_scrollback(offset);
+            let taken = offset.min(rows);
+            history.extend(parser.screen().rows(0, 100).take(taken));
+            offset -= taken;
+        }
+        parser.screen_mut().set_scrollback(0);
+        history
+    }
+
+    fn draw(render: &mut Render, rows: &[&str]) {
+        let text = Text::raw(rows.join("\n"));
+        render
+            .draw(|frame| frame.render_widget(text, frame.area()))
+            .unwrap();
+    }
+
+    /// The text bytes write, without their sequences.
+    fn printed(bytes: &[u8]) -> String {
+        let mut text = String::new();
+        let mut bytes = bytes.iter().copied();
+        while let Some(byte) = bytes.next() {
+            match byte {
+                0x1b => {
+                    if bytes.next() == Some(b'[') {
+                        for byte in bytes.by_ref() {
+                            if (0x40..0x7f).contains(&byte) {
+                                break;
+                            }
+                        }
+                    }
+                }
+                byte if byte.is_ascii_graphic() => text.push(byte as char),
+                _ => {}
+            }
+        }
+        text
+    }
+
+    #[test]
+    fn rows_scroll_into_the_history_around_with_the_drawing() {
+        let mut outer = around(4, 10);
+        let mut render = Render::new(4, 10).unwrap();
+        draw(&mut render, &["a", "b", "c", "d"]);
+        outer.process(&render.take());
+        assert_eq!(render.push(["a", "\x1b[31mb", "wider than the screen"]), 3);
+        draw(&mut render, &["d", "e", "f", "g"]);
+        let bytes = render.take();
+        outer.process(&bytes);
+        assert_eq!(history(&mut outer), ["a", "b", "wider than"]);
+        assert_eq!(outer.screen().contents(), "d\ne\nf\ng");
+        assert_eq!(
+            outer.screen().cell(1, 0).unwrap().fgcolor(),
+            vt100::Color::Default
+        );
+        // the drawing went up along, only what is new is drawn
+        assert_eq!(printed(&bytes), "abwiderthanefg");
+        assert!(bytes.starts_with(b"\x1b[?2026h") && bytes.ends_with(b"\x1b[?2026l"));
+
+        // growing, the terminal around brings history back: it goes back
+        outer.set_size(
+            std::num::NonZeroU16::new(6).unwrap(),
+            std::num::NonZeroU16::new(10).unwrap(),
+        );
+        render.resize(6, 10).unwrap();
+        draw(&mut render, &["g", "h"]);
+        outer.process(&render.take());
+        assert_eq!(history(&mut outer), ["a", "b", "wider than"]);
+        assert_eq!(outer.screen().contents(), "g\nh");
+
+        // the alternate screen draws anew and keeps the history
+        render.switch(true).unwrap();
+        assert!(render.alternate());
+        outer.process(b"\x1b[?1049h");
+        draw(&mut render, &["vim"]);
+        outer.process(&render.take());
+        assert_eq!(outer.screen().contents(), "vim");
+        render.switch(false).unwrap();
+        outer.process(b"\x1b[?1049l");
+        draw(&mut render, &["g", "h", "i"]);
+        outer.process(&render.take());
+        assert_eq!(outer.screen().contents(), "g\nh\ni");
+        assert_eq!(history(&mut outer).len(), 3);
+
+        // a program clearing its history clears it around
+        render.forget();
+        outer.process(&render.take());
+        assert!(history(&mut outer).is_empty());
+        assert_eq!(render.push([]), 0);
+        assert!(render.take().is_empty());
+    }
+
     #[test]
     fn wire_is_framed_and_bounded() {
         let mut bytes = Vec::new();

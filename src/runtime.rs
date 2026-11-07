@@ -4,13 +4,13 @@
 //! goes back as facts, which become state like any other change.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
     io::{ErrorKind, Read, Write},
     num::NonZeroU16,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::Sender,
     },
     thread,
@@ -55,6 +55,15 @@ pub const PROGRESS: Duration = Duration::from_secs(15);
 /// The longest text passed on: a notification, a copy to the clipboard.
 const MAX_TEXT: usize = 1024;
 const MAX_COPY: usize = 1 << 20;
+/// The rows a terminal keeps of its history, for the terminals around that
+/// did not see them yet.
+const HISTORY: usize = 10_000;
+/// Sequences resetting what the emulator keeps beyond the screen: a full
+/// reset (RIS) what programs asked, a clear of the saved lines the history.
+const RESETS: [&[u8]; 2] = [b"\x1bc", b"\x1b[3J"];
+
+/// Tells the runs of terminals apart.
+static RUNS: AtomicU64 = AtomicU64::new(1);
 
 /// The colors of the terminal around the person, as it told them, for
 /// programs asking: `10` foreground, `11` background, `4;n` the palette.
@@ -596,23 +605,119 @@ fn feed(parser: &mut vt100::Parser<Replies>, bytes: &[u8], end: bool) -> bool {
     shown
 }
 
-/// Process bytes; a full reset (RIS) resets what the emulator keeps beyond
-/// the screen too.
+/// Process bytes; what the emulator keeps beyond the screen resets where a
+/// sequence of `RESETS` ends, also one split between reads.
 fn process(parser: &mut vt100::Parser<Replies>, bytes: &[u8]) {
+    let begun = std::mem::take(&mut parser.callbacks_mut().begun);
     let mut rest = bytes;
-    if parser.callbacks().escaped && rest.first() == Some(&b'c') {
-        parser.process(&rest[..1]);
-        parser.callbacks_mut().reset();
-        rest = &rest[1..];
-    }
-    while let Some(found) = find(rest, b"\x1bc") {
-        parser.process(&rest[..found + 2]);
-        parser.callbacks_mut().reset();
-        rest = &rest[found + 2..];
+    let mut before = begun.as_slice();
+    loop {
+        let ends = RESETS.iter().enumerate().filter_map(|(kind, sequence)| {
+            let end = match sequence.strip_prefix(before) {
+                Some(remaining) if !before.is_empty() && rest.starts_with(remaining) => {
+                    Some(remaining.len())
+                }
+                _ => find(rest, sequence).map(|found| found + sequence.len()),
+            };
+            end.map(|end| (end, kind))
+        });
+        let Some((end, kind)) = ends.min() else {
+            break;
+        };
+        parser.process(&rest[..end]);
+        let callbacks = parser.callbacks_mut();
+        match kind {
+            0 => callbacks.reset(),
+            _ => callbacks.history.clear(),
+        }
+        rest = &rest[end..];
+        before = &[];
     }
     parser.process(rest);
-    let escaped = bytes.last() == Some(&0x1b);
-    parser.callbacks_mut().escaped = escaped;
+    // the end of the output, as long as a sequence but its last byte
+    let length = begun.len() + bytes.len();
+    let longest = RESETS
+        .iter()
+        .map(|sequence| sequence.len() - 1)
+        .max()
+        .unwrap_or(0);
+    let end: Vec<u8> = begun
+        .iter()
+        .chain(bytes)
+        .skip(length.saturating_sub(longest))
+        .copied()
+        .collect();
+    parser.callbacks_mut().begun = (0..end.len())
+        .map(|start| &end[start..])
+        .find(|end| {
+            RESETS
+                .iter()
+                .any(|sequence| sequence.len() > end.len() && sequence.starts_with(end))
+        })
+        .unwrap_or_default()
+        .to_vec();
+}
+
+/// What the main screen scrolled away, as the history of a terminal keeps
+/// it: rows with their colors, the last of them numbered `count`.
+#[derive(Default)]
+pub struct History {
+    run: u64,
+    rows: VecDeque<Box<str>>,
+    count: u64,
+    /// The times the program cleared it, `CSI 3 J`.
+    clears: u64,
+    /// Where a row is written before it is kept, as long as it needs.
+    scratch: String,
+}
+
+/// How far a terminal around has the history of a run of a terminal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    run: u64,
+    count: u64,
+    clears: u64,
+}
+
+impl History {
+    /// Keep the row written into `scratch`.
+    fn keep(&mut self) {
+        if self.rows.len() == HISTORY {
+            self.rows.pop_front();
+        }
+        self.rows.push_back(self.scratch.as_str().into());
+        self.count += 1;
+    }
+
+    fn clear(&mut self) {
+        self.rows.clear();
+        self.clears += 1;
+    }
+
+    /// What is new after `mark`: whether the program cleared the history it
+    /// has from this run since, the number of rows before the first kept
+    /// after it, and those rows.
+    pub fn since(&self, mark: Option<Mark>) -> (bool, u64, impl Iterator<Item = &str>) {
+        let mark = mark.filter(|mark| mark.run == self.run);
+        let cleared = mark.is_some_and(|mark| mark.clears != self.clears);
+        let kept = self.count - self.rows.len() as u64;
+        let after = mark.map_or(kept, |mark| mark.count.max(kept));
+        let rows = self.rows.iter().skip((after - kept) as usize);
+        (cleared, after, rows.map(|row| &**row))
+    }
+
+    /// The mark of having the rows up to `count`.
+    pub fn mark(&self, count: u64) -> Mark {
+        Mark {
+            run: self.run,
+            count,
+            clears: self.clears,
+        }
+    }
+
+    pub fn count(&self) -> u64 {
+        self.count
+    }
 }
 
 /// The emulator's side of a conversation with a program: what to answer it,
@@ -633,8 +738,10 @@ pub struct Replies {
     /// Output held back while a synchronized update goes, since when.
     held: Vec<u8>,
     held_since: Option<Instant>,
-    /// The last output ended with an escape, maybe of a split reset.
-    escaped: bool,
+    /// The start of a resetting sequence the last output ended with.
+    begun: Vec<u8>,
+    /// What the main screen scrolled away.
+    pub history: History,
     /// A bell rang that nobody saw yet.
     pub bell: bool,
     /// Progress the program reports, OSC 9;4: its state, percent and when.
@@ -651,6 +758,10 @@ impl Replies {
     fn new(palette: Arc<Mutex<Palette>>) -> Replies {
         Replies {
             palette,
+            history: History {
+                run: RUNS.fetch_add(1, Ordering::Relaxed),
+                ..History::default()
+            },
             ..Replies::default()
         }
     }
@@ -838,6 +949,17 @@ impl vt100::Callbacks for Replies {
                     .extend(format!("\x1b[?{first};{value}$y").into_bytes());
             }
             _ => {}
+        }
+    }
+
+    /// A row the main screen scrolled away goes into the history, as in
+    /// terminals; the alternate screen keeps none.
+    fn on_scroll(&mut self, row: vt100::capture::RowContents<'_>, alternate: bool) {
+        if !alternate {
+            let history = &mut self.history;
+            history.scratch.clear();
+            let _ = row.write_formatted_basic(&mut history.scratch, &mut Default::default());
+            history.keep();
         }
     }
 
@@ -1065,6 +1187,46 @@ mod tests {
                 Effect::Notify(b"\x1b]777;notify;Pi;done\x07".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn the_main_screen_keeps_what_it_scrolls_away() {
+        let (mut parser, _) = emulator();
+        let since = |parser: &vt100::Parser<Replies>, mark| {
+            let (cleared, after, rows) = parser.callbacks().history.since(mark);
+            (cleared, after, rows.map(String::from).collect::<Vec<_>>())
+        };
+        feed(
+            &mut parser,
+            b"one\r\n\x1b[31mtwo\x1b[m\r\n3\r\n4\r\n5\r\n6",
+            false,
+        );
+        assert_eq!(since(&parser, None), (false, 0, vec!["one".into()]));
+        feed(&mut parser, b"\r\n7", false);
+        let history = &parser.callbacks().history;
+        let mark = history.mark(1);
+        assert_eq!(history.count(), 2);
+        assert_eq!(
+            since(&parser, Some(mark)),
+            (false, 1, vec!["\x1b[31mtwo".into()])
+        );
+        // the alternate screen keeps none
+        feed(
+            &mut parser,
+            b"\x1b[?1049ha\r\nb\r\nc\r\nd\r\ne\r\nf\x1b[?1049l",
+            false,
+        );
+        assert_eq!(parser.callbacks().history.count(), 2);
+        // the program clears it, also in a sequence split between reads
+        let mark = parser.callbacks().history.mark(2);
+        for part in ["\x1b", "[", "3", "J\r\n8"] {
+            feed(&mut parser, part.as_bytes(), false);
+        }
+        assert_eq!(since(&parser, Some(mark)), (true, 2, vec!["3".into()]));
+        // another run has a history of its own
+        let (other, _) = emulator();
+        let mark = other.callbacks().history.mark(0);
+        assert_eq!(since(&parser, Some(mark)), (false, 2, vec!["3".into()]));
     }
 
     #[test]

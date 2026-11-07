@@ -36,8 +36,9 @@ Run these **outside nui-yalij panes**. Update uses `cargo install --locked --for
 it verifies the replacement before stopping old servers. Failed installation
 leaves the old servers running. Configuration and persisted session structure
 stay; running programs stop, and the next attachment starts the new server.
-Version 0.3.0 changes the client/server protocol: stop an old coordinator before
-attaching with the new binary; `update --apply` already handles this.
+Versions 0.3.0 and 0.4.0 change the client/server protocol: stop an old
+coordinator before attaching with the new binary; `update --apply` already
+handles this.
 
 **Uninstall is destructive, with no retained settings or backup.** It stops all
 servers in the current user's runtime locations, unregisters the managed Cargo
@@ -425,6 +426,20 @@ client asks the terminal around it on attach, giving everything back on exit:
 - **In navigation:** progress shows by its pane (and the containers above it)
   as a percentage or `working`, a bell nobody saw as `bell` until the pane is
   focused.
+- **History:** what the main screen of the focused pane's terminal scrolls
+  away goes into the history of the terminal around, as if the program ran
+  there. Its own scrolling and search reach it: zellij's scroll and search
+  modes, the mouse wheel, a terminal's find. A program on the alternate screen
+  (vim, less) gets the alternate screen around, so the wheel sends it arrows,
+  as zellij and terminals do. A program clearing its history (`CSI 3 J`, as
+  `clear` and Pi's redraws do) clears it around.
+
+The client draws on the main screen of the terminal around: attaching, what
+the screen showed scrolls into the history; detaching clears the screen and
+keeps the history. A terminal keeps the last 10 000 rows of its history: a
+terminal around gets the ones it lacks when it starts watching it, none twice,
+also attaching again from the same tty. Resizing, a terminal around may move
+rows between its screen and history: rows it brings back on growing go back.
 
 A full reset (`reset`, RIS) forgets what a program asked, as after a crash.
 
@@ -545,9 +560,9 @@ commands, concurrent startup, live files, reconnect/restart, per-instance
 profiles, decoration precedence/reload, inside attach and commands, resize
 ownership, REPL confirmation, forced shutdown, the fs representation following
 shells into folders, and the conversations of programs with the terminal
-around (keys, focus, colors, clipboard, titles, progress).
+around (keys, focus, colors, clipboard, titles, progress, history, screens).
 
 PTY content stays in memory: disconnect/reconnect preserves it, server restart
 does not. State persists and starts the terminals that should run again. No
-network transport, scrollback or mouse input yet. For background startup errors,
-see `<global.kdl>.server.log`.
+network transport or mouse input yet; scrolling is the terminal around's own.
+For background startup errors, see `<global.kdl>.server.log`.

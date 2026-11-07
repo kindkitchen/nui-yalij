@@ -15,6 +15,8 @@ use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system}
 const BIN: &str = env!("CARGO_BIN_EXE_nui-yalij");
 const ROWS: u16 = 30;
 const COLS: u16 = 110;
+/// The rows the terminal around a client keeps of its history.
+const HISTORY: usize = 1000;
 
 struct Home {
     dir: PathBuf,
@@ -152,14 +154,6 @@ struct Tui {
 }
 impl Tui {
     fn start(home: &Home, args: &[&str]) -> Tui {
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
         let mut command = CommandBuilder::new(BIN);
         command.args([
             "--state",
@@ -168,6 +162,29 @@ impl Tui {
             home.config().to_str().unwrap(),
         ]);
         command.args(args);
+        Tui::spawn(home, command)
+    }
+    /// A shell running `script` in the PTY, `{nui}` in it naming this binary
+    /// with the home's state and config.
+    fn shell(home: &Home, script: &str) -> Tui {
+        let nui = format!(
+            "{BIN} --state {} --config {}",
+            home.global().display(),
+            home.config().display()
+        );
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", &script.replace("{nui}", &nui)]);
+        Tui::spawn(home, command)
+    }
+    fn spawn(home: &Home, mut command: CommandBuilder) -> Tui {
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: ROWS,
+                cols: COLS,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
         for (key, value) in home.env() {
             command.env(key, value);
         }
@@ -184,7 +201,11 @@ impl Tui {
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
         let size = |n| NonZeroU16::new(n).unwrap();
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(size(ROWS), size(COLS), 0)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(
+            size(ROWS),
+            size(COLS),
+            HISTORY,
+        )));
         let raw = Arc::new(Mutex::new(Vec::new()));
         let (output, written) = (screen.clone(), raw.clone());
         thread::spawn(move || {
@@ -215,6 +236,19 @@ impl Tui {
     }
     fn rows(&self) -> Vec<String> {
         self.screen.lock().unwrap().screen().rows(0, COLS).collect()
+    }
+    /// The rows the screen around scrolled away, oldest first.
+    fn history(&self) -> Vec<String> {
+        let mut parser = self.screen.lock().unwrap();
+        let (mut history, mut offset) = (Vec::new(), parser.screen().scrollback_len());
+        while offset > 0 {
+            parser.screen_mut().set_scrollback(offset);
+            let taken = offset.min(ROWS as usize);
+            history.extend(parser.screen().rows(0, COLS).take(taken));
+            offset -= taken;
+        }
+        parser.screen_mut().set_scrollback(0);
+        history
     }
     fn wait(&self, about: &str, condition: impl Fn(&Tui) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(12);
@@ -794,6 +828,80 @@ fn last_typing_client_owns_shared_terminal_size() {
 }
 
 #[test]
+fn the_terminal_around_keeps_the_history_of_the_terminal_watched() {
+    let home = Home::new("history");
+    // attaching twice from the same terminal around
+    // a shell not interactive drops PS1 for what it runs
+    let mut tui = Tui::shell(
+        &home,
+        "export PS1='$ '; {nui} attach main; {nui} attach main",
+    );
+    tui.prompt();
+    let numbers = |history: &[String], from: u32| -> Vec<u32> {
+        history
+            .iter()
+            .filter_map(|row| row.trim().parse().ok())
+            .filter(|n| (from..from + 1000).contains(n))
+            .collect()
+    };
+    // what scrolls away goes into its history, in order, once; the rows the
+    // screen still shows are not history yet
+    tui.send("seq 1000 1099\r");
+    tui.wait("the history", |tui| tui.history().len() == 72);
+    let history = tui.history();
+    assert_eq!(history[0].trim_end(), "$ seq 1000 1099");
+    assert_eq!(numbers(&history, 1000), (1000..=1070).collect::<Vec<_>>());
+    assert!(tui.rows()[0].starts_with("1071") && tui.rows()[29].starts_with('$'));
+
+    // a program on the alternate screen gets the alternate screen around,
+    // keys told apart there too, and leaves the history as it was
+    tui.send("printf '\\033[?1049halt-%s' $((6 * 7)); sleep 1; printf '\\033[?1049l'\r");
+    tui.text_is("alt-42");
+    assert!(tui.raw().contains("\x1b[?1049h\x1b[>7u"));
+    tui.wait("the main screen", |tui| {
+        tui.raw().contains("\x1b[<u\x1b[?1049l") && !tui.text().contains("alt-42")
+    });
+    // the line typed pushed the top row away
+    assert_eq!(
+        numbers(&tui.history(), 1000),
+        (1000..=1071).collect::<Vec<_>>()
+    );
+
+    // a program clearing its history clears it around
+    tui.send("printf '\\033[3J'\r");
+    tui.wait("the history cleared", |tui| tui.history().is_empty());
+    tui.send("seq 2000 2099\r");
+    tui.wait("the history", |tui| {
+        numbers(&tui.history(), 2000).len() == 71
+    });
+    assert_eq!(
+        numbers(&tui.history(), 1000),
+        (1073..=1099).collect::<Vec<_>>()
+    );
+
+    // another terminal around gets the history it never had
+    let mut other = Tui::start(&home, &["attach", "main"]);
+    other.wait("the history", |tui| {
+        numbers(&tui.history(), 2000) == (2000..=2070).collect::<Vec<_>>()
+    });
+    other.detach("\x14");
+
+    // attaching again from the same one: what it has stays once
+    tui.send("\x14");
+    tui.text_is(" native ");
+    tui.send("q");
+    tui.wait("attached again", |tui| {
+        tui.raw().matches("\x1b[>7u").count() >= 2
+    });
+    tui.text_is("2099");
+    assert_eq!(
+        numbers(&tui.history(), 2000),
+        (2000..=2070).collect::<Vec<_>>()
+    );
+    tui.detach("\x14");
+}
+
+#[test]
 fn repl_completes_then_requires_explicit_yes_even_with_apply() {
     let home = Home::new("repl");
     let mut cancelled = Tui::start(&home, &["--repl"]);
@@ -987,7 +1095,7 @@ fn shutdown_restarts_from_independent_session_states() {
     assert_eq!(unsafe { libc::kill(second as i32, 0) }, -1);
 
     let mut again = Tui::start(&home, &["attach", "main"]);
-    again.wait("client ready", |tui| tui.raw().contains("\x1b[?1049h"));
+    again.wait("client ready", |tui| tui.raw().contains("\x1b[>7u"));
     again.send("\x14");
     again.text_is("exited");
     assert!(home.read(1).contains("exit=5"));
