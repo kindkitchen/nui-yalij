@@ -6,20 +6,13 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
 pub struct Store {
     path: PathBuf,
-    known: Option<(Stamp, String)>,
+    known: Option<String>,
     held: bool,
     lock: Option<File>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Stamp {
-    modified: SystemTime,
-    len: u64,
 }
 
 pub fn mkdir(path: &Path) -> Result<(), String> {
@@ -55,13 +48,18 @@ impl Store {
     }
 
     pub fn load(&mut self) -> Result<Option<String>, String> {
+        let text = self
+            .read()
+            .map_err(|error| format!("{}: {error}", self.path.display()))?;
+        self.known = text.clone();
+        Ok(text)
+    }
+
+    fn read(&self) -> std::io::Result<Option<String>> {
         match fs::read_to_string(&self.path) {
-            Ok(text) => {
-                self.known = self.stamp().map(|stamp| (stamp, text.clone()));
-                Ok(Some(text))
-            }
+            Ok(text) => Ok(Some(text)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(format!("{}: {error}", self.path.display())),
+            Err(error) => Err(error),
         }
     }
 
@@ -93,10 +91,15 @@ impl Store {
     }
 
     pub fn save(&mut self, text: &str) -> Result<(), String> {
-        let known = self.known.as_ref();
-        if self.held
-            || known.is_some_and(|(_, known)| known == text)
-            || self.stamp() != known.map(|(stamp, _)| *stamp)
+        if self.held || self.known.as_deref() == Some(text) {
+            return Ok(());
+        }
+        // Equal length and mtime do not imply equal contents, particularly for
+        // rapid edits on Linux or editors preserving file timestamps.
+        if self
+            .read()
+            .map_err(|error| format!("{}: {error}", self.path.display()))?
+            != self.known
         {
             return Ok(());
         }
@@ -112,45 +115,35 @@ impl Store {
                 .open(&aside)?;
             file.write_all(text.as_bytes())?;
             file.sync_all()?;
-            fs::rename(&aside, &self.path)
+            // An edit may arrive while the replacement is being written/synced.
+            if self.read()? != self.known {
+                return Ok(false);
+            }
+            fs::rename(&aside, &self.path)?;
+            Ok::<_, std::io::Error>(true)
         })();
-        if result.is_err() {
+        if !matches!(result, Ok(true)) {
             let _ = fs::remove_file(&aside);
         }
-        result.map_err(|error| format!("{}: {error}", self.path.display()))?;
-        self.known = self.stamp().map(|stamp| (stamp, text.to_owned()));
+        if result.map_err(|error| format!("{}: {error}", self.path.display()))? {
+            self.known = Some(text.to_owned());
+        }
         Ok(())
     }
 
     pub fn poll(&mut self) -> Option<Result<String, String>> {
-        if self.stamp() == self.known.as_ref().map(|(stamp, _)| *stamp) {
-            return None;
-        }
-        let previous = self.known.as_ref().map(|(_, text)| text.clone());
-        match self.load() {
-            Ok(None) => {
-                self.known = None;
+        match self.read() {
+            Ok(text) if text == self.known => None,
+            Ok(text) => {
+                self.known = text.clone();
                 self.held = false;
-                None
-            }
-            Ok(Some(text)) if previous.as_ref() == Some(&text) => None,
-            Ok(Some(text)) => {
-                self.held = false;
-                Some(Ok(text))
+                text.map(Ok)
             }
             Err(error) => {
                 self.held = true;
-                Some(Err(error))
+                Some(Err(format!("{}: {error}", self.path.display())))
             }
         }
-    }
-
-    fn stamp(&self) -> Option<Stamp> {
-        let metadata = fs::metadata(&self.path).ok()?;
-        Some(Stamp {
-            modified: metadata.modified().ok()?,
-            len: metadata.len(),
-        })
     }
 }
 
@@ -178,6 +171,58 @@ mod tests {
         assert_eq!(store.poll().unwrap().unwrap(), "session fixed\n");
         store.save("session main\n").unwrap();
         assert_eq!(fs::read_to_string(store.path()).unwrap(), "session main\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn equal_length_edits_with_unchanged_mtime_are_detected_and_preserved() {
+        let dir = std::env::temp_dir().join(format!("nui-store-collision-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::new(dir.join("state.kdl"));
+        store.save("session main\n").unwrap();
+        let path = store.path().to_path_buf();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let external = |text: &str| {
+            assert_eq!(text.len(), "session main\n".len());
+            fs::write(&path, text).unwrap();
+            File::open(&path).unwrap().set_modified(modified).unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        };
+        external("session work\n");
+        store.save("message mine\n").unwrap();
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), "session work\n");
+        assert_eq!(store.poll().unwrap().unwrap(), "session work\n");
+        // Invalid edits and repairs may have the same length AND timestamp too.
+        external("session {   \n");
+        assert_eq!(store.poll().unwrap().unwrap(), "session {   \n");
+        store.reject();
+        store.save("session main\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "session {   \n");
+        external("session safe\n");
+        assert_eq!(store.poll().unwrap().unwrap(), "session safe\n");
+        store.save("session main\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "session main\n");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_content_and_unseen_deletion_are_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("nui-store-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::new(dir.join("state.kdl"));
+        store.save("session main\n").unwrap();
+        fs::write(store.path(), [0xff]).unwrap();
+        assert!(store.save("session other\n").is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), [0xff]);
+        assert!(store.poll().unwrap().is_err());
+        fs::write(store.path(), "session fixed\n").unwrap();
+        assert_eq!(store.poll().unwrap().unwrap(), "session fixed\n");
+        fs::remove_file(store.path()).unwrap();
+        store.save("session other\n").unwrap();
+        assert!(!store.path().exists());
+        assert!(store.poll().is_none());
+        store.save("session other\n").unwrap();
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), "session other\n");
         let _ = fs::remove_dir_all(dir);
     }
 

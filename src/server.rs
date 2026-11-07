@@ -20,6 +20,8 @@ use crate::{
 };
 
 pub const TICK: Duration = Duration::from_millis(250);
+/// Repaint promptly even when scrolling/key repeats keep the queue full.
+const INPUT_BUDGET: Duration = Duration::from_millis(16);
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn stop(_: libc::c_int) {
@@ -92,16 +94,15 @@ pub fn serve(state: PathBuf, config: PathBuf, legacy: Option<PathBuf>) -> Result
                 .min(Duration::from_millis(40));
             match received.recv_timeout(delay) {
                 Ok(event) => {
+                    let until = Instant::now() + INPUT_BUDGET;
                     app.handle(event);
-                    // Bound each batch so floods cannot starve accepts, ticks or drawings.
-                    for _ in 0..255 {
-                        let Ok(event) = received.try_recv() else {
-                            break;
-                        };
-                        app.handle(event);
-                        if app.quit {
-                            break;
-                        }
+                    // A count limit alone allows slow handlers to postpone every
+                    // redraw for seconds. Bound time as well as queue consumption.
+                    if !app.quit {
+                        drain(&received, until, |event| {
+                            app.handle(event);
+                            !app.quit
+                        });
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -116,4 +117,67 @@ pub fn serve(state: PathBuf, config: PathBuf, legacy: Option<PathBuf>) -> Result
     })();
     app.shutdown();
     result
+}
+
+fn drain<T>(received: &mpsc::Receiver<T>, until: Instant, mut handle: impl FnMut(T) -> bool) {
+    for _ in 0..255 {
+        if Instant::now() >= until {
+            break;
+        }
+        let Ok(event) = received.try_recv() else {
+            break;
+        };
+        if !handle(event) {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_batches_yield_to_drawing_even_with_a_full_queue() {
+        let (sent, received) = mpsc::channel();
+        for event in 0..300 {
+            sent.send(event).unwrap();
+        }
+        let mut handled = 0;
+        drain(&received, Instant::now() + INPUT_BUDGET, |_| {
+            handled += 1;
+            std::thread::sleep(INPUT_BUDGET + Duration::from_millis(1));
+            true
+        });
+        assert!(
+            handled <= 1,
+            "slow input must not postpone a repaint for an entire batch"
+        );
+        assert!(
+            received.try_recv().is_ok(),
+            "the backlog is left for the next frame"
+        );
+    }
+
+    #[test]
+    fn batches_keep_the_count_limit_and_stop_on_shutdown() {
+        let (sent, received) = mpsc::channel();
+        for event in 0..300 {
+            sent.send(event).unwrap();
+        }
+        let mut handled = 0;
+        drain(&received, Instant::now() + Duration::from_secs(60), |_| {
+            handled += 1;
+            true
+        });
+        assert_eq!(handled, 255);
+        drain(&received, Instant::now() + Duration::from_secs(60), |_| {
+            handled += 1;
+            false
+        });
+        assert_eq!(handled, 256);
+        drain(&received, Instant::now() - INPUT_BUDGET, |_| {
+            panic!("expired budget")
+        });
+    }
 }

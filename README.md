@@ -27,7 +27,7 @@ Lifecycle commands **observe by default**; `--apply` performs the operation:
 ```nu
 nui-yalij update                  # Show the plan
 nui-yalij update --apply          # Install latest, then stop old servers
-nui-yalij update 0.3.0 --apply     # Or install an exact version
+nui-yalij update 0.3.1 --apply     # Or install an exact version
 nui-yalij uninstall               # List everything that will be wiped
 nui-yalij uninstall --apply       # Stop servers, remove the binary and wipe data
 ```
@@ -195,7 +195,9 @@ enter restarts the hovered pane's terminal.
 ## Navigation: representations of the state
 
 Navigation shows a **representation** of the state: a mapping of it into
-sections, as in yazi. The tabs on its top border name them; `[` and `]`
+sections, as in yazi. Under a sustained burst of scrolling/key input, the server
+yields to repaint after a 16 ms event-batch budget instead of draining a whole
+256-event batch first. The tabs on its top border name them; `[` and `]`
 switch, around, and the panel opens again on the one it showed last, at the
 focused pane. Every representation points to the same terminal, the one its
 last section previews: what one hovers or enters, the next one shown points
@@ -298,7 +300,9 @@ their labels from what they show. The earlier shape, sessions of `window`s of
 Each file has one locked writer. Client input, runtime facts, plugins and file
 edits are serialized; clients send **events, never stale replacement states**.
 Files are atomically replaced, and external edits are consumed before the next
-interactive mutation. Invalid edits are reported and left untouched until fixed.
+interactive mutation. Changes are compared by contents, including immediately
+before replacement, so rapid equal-length edits or preserved timestamps are not
+mistaken for unchanged files. Invalid edits are reported and left untouched until fixed.
 Valid edits affect every viewer of that session. The global file is live too.
 
 Removing a session from the catalog stops its owner but keeps its files for
