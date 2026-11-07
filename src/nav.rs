@@ -10,8 +10,8 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::folders;
 use crate::state::{Level, Location, Navigation, Nui, Operation, StateRepresentation};
+use crate::{folders, search};
 
 /// What a key in the panel asks of the application, beyond the state.
 #[derive(Debug, PartialEq)]
@@ -29,6 +29,7 @@ pub fn open(nui: &mut Nui) {
             cursor,
             folder: None,
             operation: None,
+            search: None,
         });
     }
 }
@@ -51,6 +52,13 @@ pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
     };
     let representation = nui.representation;
     nui.message = None;
+    if nui
+        .navigation
+        .as_ref()
+        .is_some_and(|nav| nav.search.is_some())
+    {
+        return search::key(nui, key);
+    }
     match operation {
         Some(mut operation @ (Operation::Rename { .. } | Operation::Create { .. })) => {
             match key.code {
@@ -96,6 +104,7 @@ pub fn key(nui: &mut Nui, key: &KeyEvent, shell: &str) -> Outcome {
             _ => {}
         },
         None => match key.code {
+            KeyCode::Char('/') => search::start(nui),
             KeyCode::Char('[') => switch(nui, -1),
             KeyCode::Char(']') => switch(nui, 1),
             KeyCode::Esc => close(nui),
@@ -158,6 +167,14 @@ fn switch(nui: &mut Nui, delta: isize) {
 
 /// Pasted text goes into a name being typed, as typed.
 pub fn paste(nui: &mut Nui, text: &str) {
+    if nui
+        .navigation
+        .as_ref()
+        .is_some_and(|nav| nav.search.is_some())
+    {
+        search::paste(nui, text);
+        return;
+    }
     let operation = nui
         .navigation
         .as_mut()

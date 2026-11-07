@@ -27,7 +27,7 @@ Lifecycle commands **observe by default**; `--apply` performs the operation:
 ```nu
 nui-yalij update                  # Show the plan
 nui-yalij update --apply          # Install latest, then stop old servers
-nui-yalij update 0.2.0 --apply     # Or install an exact version
+nui-yalij update 0.3.0 --apply     # Or install an exact version
 nui-yalij uninstall               # List everything that will be wiped
 nui-yalij uninstall --apply       # Stop servers, remove the binary and wipe data
 ```
@@ -36,6 +36,8 @@ Run these **outside nui-yalij panes**. Update uses `cargo install --locked --for
 it verifies the replacement before stopping old servers. Failed installation
 leaves the old servers running. Configuration and persisted session structure
 stay; running programs stop, and the next attachment starts the new server.
+Version 0.3.0 changes the client/server protocol: stop an old coordinator before
+attaching with the new binary; `update --apply` already handles this.
 
 **Uninstall is destructive, with no retained settings or backup.** It stops all
 servers in the current user's runtime locations, unregisters the managed Cargo
@@ -108,6 +110,29 @@ nui-yalij call t
 `--state <global.kdl>` selects a catalog; different catalogs are independent.
 `--config <dir>` selects its global/profile decoration directory. Every client of
 a catalog must use the same config directory; `--profile <name>` is per instance.
+Shells inside panes inherit `NUI_YALIJ_CONFIG`, so config commands use the right
+root there too. A shared pane has no single profile; supply `--profile` explicitly.
+
+Configuration and agent help, without starting a server:
+
+```nu
+nui-yalij config path             # Selected file (also the default config action)
+nui-yalij config show             # File contents, or a default template if missing
+nui-yalij config init             # Preview creating a starter
+nui-yalij config init --apply     # Create it; never overwrite an existing file
+nui-yalij config check            # Validate global and all profile files
+nui-yalij --profile work config path  # Select profiles/work.kdl instead
+nui-yalij skill                   # Print the bundled agent skill as Markdown
+```
+
+Edit the file from `config path`, validate it, then run `nui-yalij reload` to
+apply global/profile changes to a running server. `config check` checks KDL and
+the selected profile, not plugin execution or session overrides (checked live).
+
+[`skills/nui-yalij/SKILL.md`](skills/nui-yalij/SKILL.md) explains the application,
+config schema, layers, navigation and safe agent workflows. `nui-yalij skill`
+prints that exact file, so it can be saved into your agent's skill directory.
+It never installs a skill or modifies agent settings automatically.
 
 Inside a pane, `nui-yalij attach other` switches the connected instance that last
 typed into that terminal, not every viewer. The spawned shell inherits
@@ -140,10 +165,12 @@ Default keys (overridable by decoration):
 | Where      | Key         | Action |
 |------------|-------------|--------|
 | view       | ctrl-t      | Open/close navigation (`t` in a pane does too) |
+| view       | esc twice / held | Open navigation (300 ms double press / 600 ms hold) |
 | view       | enter       | Restart the focused stopped/exited terminal |
 | navigation | [ / ]       | Show the previous/next representation |
 | navigation | h/l, ←/→    | Focus the section left/right |
 | navigation | j/k, ↓/↑    | Hover next/previous; sections to the right follow |
+| navigation | /           | Search all panes; type to filter, enter to browse results |
 | navigation | a           | Add after hovered item, naming each level |
 | navigation | r/x/s       | Rename/remove/stop hovered item |
 | navigation | enter       | Approve operation; enter pane or next section |
@@ -189,6 +216,31 @@ to as well. The bottom half stays the terminal you opened the panel from.
   the active pane of its session when that shows it, else the first. The
   folders follow shells as they `cd`; the place stays by path, not position.
   An icon tells a folder from a terminal: see `icons` in decoration.
+
+### Pane search
+
+`/` in either representation opens a search prompt with a pane list below and
+a preview alongside. Every key updates the fuzzy-ranked matches across **all
+sessions**, using session/workspace/window/pane names, cwd paths, terminal
+programs/titles, commands and arguments. Rename/create prompts keep `/` as text.
+No external `fzf` executable is needed.
+
+Matching is Unicode-aware and fzf-style: fuzzy subsequences, smart case
+(uppercase makes a term case-sensitive), space-separated AND terms (which may
+match different fields), `|` alternatives, `'text` exact substring, `^text`
+prefix, `text$` suffix and `!text` exclusion. For example, `work src$ !logs`
+finds panes under a matching workspace/session and path, excluding log panes.
+
+- **Typing:** Backspace deletes, Ctrl-U clears, paste updates the query;
+  Escape cancels back to normal navigation.
+- **Enter freezes the list** and focuses its results, without entering a pane.
+  j/k or arrows browse; another Enter opens the selected pane.
+- `/` re-edits the query; Escape leaves the results for normal navigation.
+
+The original terminal remains below the panel. Search is per instance; merely
+hovering does not switch anybody's active pane. New matches do not join a frozen
+list. Removed targets disappear safely; reordered sessions/placements resolve
+by session/terminal identity, never to unrelated terminals at old indices.
 
 ## State: global wrapper and independent session files
 
@@ -288,6 +340,7 @@ keys {
     rename r
     remove x
     stop s
+    search "/"
     enter enter
     back esc
     detach q
@@ -297,6 +350,7 @@ keys {
 commands {
     panel t
 }
+gestures double-escape-ms=300 hold-escape-ms=600
 theme accent=blue active=green muted=darkgray notice=yellow error=red
 icons nerd
 plugin "~/path/to/plugins/example.lua"
@@ -306,14 +360,30 @@ plugin "~/path/to/plugins/example.lua"
 default, or `plain` (`▸`, `$`) where the font has none. No terminal tells
 which, so a profile, decorating the instance in that terminal, can say it.
 
-Later layers replace individual key and command actions, theme fields and
-icons; an action with no arguments disables it. Keys may hold `ctrl-`,
+Later layers replace individual key and command actions, gesture properties,
+theme fields and icons; an action with no arguments disables it. Keys may hold `ctrl-`,
 `alt-`, `super-` and `shift-`. Command names are plain file names. Every
 profile's commands are written into a session, but a call only works for the
 calling instance's own; `reload` and live session edits rewrite them. Plugin
 lists accumulate, later entries take precedence, and duplicate paths load
 once. Paths are relative to **their decoration file**, or start with `~/`.
 Unknown nodes, actions, properties, keys and colors are errors.
+
+Escape gestures apply only in the terminal view and **open**, never toggle,
+navigation. `double-escape-ms` and `hold-escape-ms` take integers from 0 to
+60000 milliseconds; **0 disables that gesture independently**. For example:
+
+```kdl
+// Double Escape off; hold for 800 ms instead. ctrl-t still works.
+gestures double-escape-ms=0 hold-escape-ms=800
+```
+
+The first Escape is sent to the program immediately, keeping ordinary Escape
+responsive. Precise holds require the outer terminal's kitty keyboard repeat/
+release reports, which the client now requests. Other terminals use a recent
+auto-repeat burst: no repeat means no detectable hold, and rapid presses cannot
+always be distinguished from repeats. `ctrl-t` remains the portable fallback.
+Gestures never run in navigation/search or rename/create prompts.
 
 A profile decorates its instance; it cannot impose active windows, layout names or
 other session state. Attaching/reloading a profile never runs its automatic
@@ -466,7 +536,8 @@ cargo clippy --locked --all-targets -- -D warnings
 ```
 
 Tests include real multi-client PTYs, same/different sessions, foreign-session
-navigation edits, concurrent startup, live files, reconnect/restart, per-instance
+navigation edits, Escape gestures, live/frozen fuzzy search, config/skill CLI
+commands, concurrent startup, live files, reconnect/restart, per-instance
 profiles, decoration precedence/reload, inside attach and commands, resize
 ownership, REPL confirmation, forced shutdown, the fs representation following
 shells into folders, and the conversations of programs with the terminal

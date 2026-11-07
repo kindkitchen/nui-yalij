@@ -62,6 +62,7 @@ impl SessionServer {
         let mut runtime = Runtime::new(events, (24, 80));
         runtime.owner = id;
         runtime.global = Some(global.to_path_buf());
+        runtime.config = Some(library.root.clone());
         runtime.bin = Some(store.dir().join("bin"));
         let mut server = Self {
             state: state.clone(),

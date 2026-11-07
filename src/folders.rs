@@ -401,6 +401,7 @@ pub(crate) mod tests {
             cursor,
             folder: folder.map(Into::into),
             operation: None,
+            search: None,
         });
     }
 

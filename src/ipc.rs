@@ -24,7 +24,7 @@ use crate::{
     store::mkdir,
 };
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 const MAX_MESSAGE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +38,8 @@ pub enum Request {
         size: (u16, u16),
     },
     Input(crossterm::event::Event),
+    /// Keyboard flags negotiated by the client; flag 2 enables precise holds.
+    Keyboard(u16),
     /// The colors of the terminal around an attached client, for programs asking.
     Colors(Palette),
     Switch {

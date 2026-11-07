@@ -16,7 +16,7 @@ use crate::folders::{self, Item, Tree, View};
 use crate::layout::{Draw, Scene, Shown};
 use crate::runtime::{Screens, lock};
 use crate::state::{
-    Level, Location, Navigation, Nui, Operation, StateRepresentation, Status, Terminal,
+    Level, Location, Navigation, Nui, Operation, Search, StateRepresentation, Status, Terminal,
 };
 
 /// The keys of a representation: the fs one is only moved in.
@@ -32,7 +32,7 @@ fn hints(d: &Decoration, representation: StateRepresentation) -> String {
         StateRepresentation::Fs => String::new(),
     };
     format!(
-        "{}{}{}{} move  {} go  {}{} tabs{operations}  {} back  {} detach  {} shutdown",
+        "{}{}{}{} move  {} go  {}{} tabs{operations}  {} search  {} back  {} detach  {} shutdown",
         d.hint("left"),
         d.hint("next"),
         d.hint("previous"),
@@ -40,6 +40,7 @@ fn hints(d: &Decoration, representation: StateRepresentation) -> String {
         d.hint("enter"),
         d.hint("previous-tab"),
         d.hint("next-tab"),
+        d.hint("search"),
         d.hint("back"),
         d.hint("detach"),
         d.hint("quit")
@@ -68,6 +69,11 @@ pub fn navigation(frame: &mut Frame, nui: &Nui, runtime: &impl Screens, decorati
     };
     let [top, bottom] =
         Layout::vertical([Constraint::Percentage(50), Constraint::Fill(1)]).areas(frame.area());
+    if let Some(search) = &navigation.search {
+        search_panel(frame, nui, runtime, search, top, decoration);
+        origin(frame.buffer_mut(), nui, runtime, bottom, decoration);
+        return;
+    }
     let [bar, sections, status] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -122,6 +128,131 @@ pub fn navigation(frame: &mut Frame, nui: &Nui, runtime: &impl Screens, decorati
         }
         Some(operation) => confirm(frame, nui, navigation, operation, top, &decoration.theme),
         None => {}
+    }
+}
+
+/// Search takes the upper panel, keeping the original terminal below it.
+/// The list is live only while typing; its captured targets supply the preview.
+fn search_panel(
+    frame: &mut Frame,
+    nui: &Nui,
+    runtime: &impl Screens,
+    search: &Search,
+    area: Rect,
+    decoration: &Decoration,
+) {
+    let theme = &decoration.theme;
+    let [bar, body, status] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(area);
+    let columns: [Rect; 2] = Layout::horizontal([Constraint::Percentage(65), Constraint::Fill(1)])
+        .spacing(1)
+        .areas(body);
+    let buffer = frame.buffer_mut();
+    let selected = search.selected.min(search.results.len().saturating_sub(1));
+    let mark = if search.editing {
+        Style::new().underlined()
+    } else {
+        Style::new().reversed().bold()
+    };
+    listing(
+        buffer,
+        columns[0],
+        Span::raw(" panes").fg(theme.accent),
+        search.results.len(),
+        Some((selected, mark)),
+        |index| {
+            let hit = &search.results[index];
+            let mut spans = vec![Span::raw(format!(
+                " {} {}",
+                decoration.icons.terminal(),
+                hit.label
+            ))];
+            if let Some(at) = hit.resolve(nui) {
+                spans.extend(marks(
+                    nui,
+                    runtime,
+                    &[(at.session, hit.terminal)],
+                    true,
+                    theme,
+                ));
+            }
+            Line::from(spans)
+        },
+    );
+    if search.results.is_empty() && columns[0].height > 1 {
+        buffer.set_stringn(
+            columns[0].x,
+            columns[0].y + 1,
+            " No matching panes",
+            columns[0].width as usize,
+            theme.muted,
+        );
+    }
+    if let Some(at) = search
+        .results
+        .get(selected)
+        .and_then(|hit| hit.resolve(nui))
+    {
+        screen(buffer, nui, runtime, at, columns[1], decoration);
+    }
+    rules(buffer, &columns, theme);
+    let hints = if search.editing {
+        "type to filter  enter: browse  esc: cancel  ctrl-u: clear".to_string()
+    } else {
+        format!(
+            "{}/{} move  {} open  {} edit search  {} back",
+            decoration.hint("next"),
+            decoration.hint("previous"),
+            decoration.hint("enter"),
+            decoration.hint("search"),
+            decoration.hint("back")
+        )
+    };
+    if !status.is_empty() {
+        let text = nui
+            .message
+            .as_deref()
+            .and_then(|message| message.lines().next())
+            .unwrap_or(&hints);
+        buffer.set_stringn(status.x, status.y, text, status.width as usize, theme.muted);
+    }
+    if !bar.is_empty() {
+        let counter = format!(
+            " {}/{} panes ",
+            if search.results.is_empty() {
+                0
+            } else {
+                selected + 1
+            },
+            search.results.len()
+        );
+        let [input, count] = Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(Line::raw(&counter).width() as u16),
+        ])
+        .areas(bar);
+        buffer.set_stringn(count.x, count.y, counter, count.width as usize, theme.muted);
+        if !input.is_empty() {
+            let prefix = if search.editing { "/ " } else { "Search / " };
+            let text = format!(
+                "{prefix}{}",
+                tail(
+                    &search.query,
+                    input.width.saturating_sub(prefix.len() as u16 + 1)
+                )
+            );
+            buffer.set_stringn(input.x, input.y, &text, input.width as usize, theme.accent);
+            if search.editing {
+                frame.set_cursor_position((
+                    input.x + (Line::raw(text).width() as u16).min(input.width - 1),
+                    input.y,
+                ));
+            }
+        }
     }
 }
 
@@ -855,12 +986,34 @@ mod tests {
                             cursor: Location::default(),
                             folder: folder.map(Into::into),
                             operation: operation.clone(),
+                            search: None,
                         });
                         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                         terminal
                             .draw(|frame| navigation(frame, &nui, &runtime, &Decoration::default()))
                             .unwrap();
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_shows_results_and_origin_and_handles_any_size() {
+        let mut nui = sample();
+        crate::nav::open(&mut nui);
+        crate::search::start(&mut nui);
+        let rows = draw(&nui, &Decoration::default(), 120, 20).1;
+        assert!(rows[0].contains("1/4 panes"), "{}", rows[0]);
+        assert!(rows[2].contains("main ›"), "{}", rows[2]);
+        assert!(rows[10].contains("main › sh › sh › sh"), "{}", rows[10]);
+        for query in ["", "no match", "very long résumé 東京 ".repeat(20).as_str()] {
+            for editing in [true, false] {
+                let search = nui.navigation.as_mut().unwrap().search.as_mut().unwrap();
+                search.query = query.into();
+                search.editing = editing;
+                for (width, height) in [(1, 1), (20, 1), (10, 3), (40, 2), (30, 8), (200, 60)] {
+                    draw(&nui, &Decoration::default(), width, height);
                 }
             }
         }
@@ -879,6 +1032,7 @@ mod tests {
                 cursor: top,
                 folder: None,
                 operation: None,
+                search: None,
             });
             draw(&nui, &Decoration::default(), 120, 20).1
         };
@@ -917,6 +1071,7 @@ mod tests {
                 cursor,
                 folder: folder.map(Into::into),
                 operation: None,
+                search: None,
             });
         };
         at(&mut nui, None);

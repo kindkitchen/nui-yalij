@@ -1,6 +1,6 @@
 [package]
 name = "nui-yalij"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Shared terminal sessions driven by KDL state and layered decoration"
@@ -9,7 +9,7 @@ repository = "https://github.com/kindkitchen/nui-yalij"
 readme = "README.md"
 keywords = ["terminal", "multiplexer", "tui"]
 categories = ["command-line-utilities"]
-include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/**", "tests/**", "plugins/**"]
+include = ["Cargo.toml", "Cargo.lock", "LICENSE", "README.md", "src/**", "tests/**", "plugins/**", "skills/**"]
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/nui-yalij-{ version }/{ name }-{ version }-{ target }.tar.gz"
@@ -21,6 +21,7 @@ crossterm = { version = "0.29", features = ["serde"] }
 kdl = "6"
 libc = "0.2"
 mlua = { version = "0.12", features = ["lua54", "vendored", "serde"] }
+nucleo-matcher = "0.3"
 portable-pty = "0.9"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 serde = { version = "1", features = ["derive"] }

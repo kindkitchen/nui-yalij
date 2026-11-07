@@ -85,6 +85,7 @@ pub struct Runtime {
     generation: u64,
     pub owner: u64,
     pub global: Option<PathBuf>,
+    pub config: Option<PathBuf>,
     /// The commands of decoration, first on the PATH of programs.
     pub bin: Option<PathBuf>,
     /// Children already hung up but not yet reaped. A daemon must not exit
@@ -122,6 +123,7 @@ impl Runtime {
             generation: 0,
             owner: 0,
             global: None,
+            config: None,
             bin: None,
             retiring: Vec::new(),
             palette: Arc::default(),
@@ -200,6 +202,9 @@ impl Runtime {
             command.env("NUI_YALIJ_STATE", global);
             command.env("NUI_YALIJ_SESSION", self.owner.to_string());
             command.env("NUI_YALIJ_TERMINAL", terminal.id.to_string());
+        }
+        if let Some(config) = &self.config {
+            command.env("NUI_YALIJ_CONFIG", config);
         }
         if let Some(bin) = &self.bin {
             let path = std::env::var_os("PATH").unwrap_or_default();

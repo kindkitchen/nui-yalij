@@ -80,6 +80,7 @@ esac
                 ),
             )
             .env_remove("NUI_YALIJ_STATE")
+            .env_remove("NUI_YALIJ_CONFIG")
             .env_remove("FAIL_CARGO");
         command
     }

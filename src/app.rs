@@ -7,12 +7,14 @@ use std::{
     fs,
     path::Path,
     sync::{atomic::Ordering, mpsc::Sender},
+    time::Instant,
 };
 
 use ratatui::crossterm::event::{Event as Input, KeyEvent, KeyEventKind};
 
 use crate::{
     decoration::{Decoration, Layer, Library},
+    gestures::{Action, Escapes},
     global::{Catalog, Client},
     ipc::{self, Peer, Render, Request, Response},
     keys,
@@ -61,6 +63,7 @@ pub struct App {
 /// The terminal around a client, as far as programs reach it.
 #[derive(Default)]
 struct Outer {
+    escapes: Escapes,
     /// It told it lost the focus.
     unfocused: bool,
     palette: Option<Palette>,
@@ -619,7 +622,7 @@ impl App {
                 self.dirty = true;
             }
             Request::Input(input) if self.catalog.client(id).is_some() => match input {
-                Input::Key(key) if key.kind != KeyEventKind::Release => self.key(id, key)?,
+                Input::Key(key) => self.key(id, key)?,
                 Input::Paste(text) => self.paste(id, &text)?,
                 Input::Resize(cols, rows) => {
                     if let Some(render) = self
@@ -633,12 +636,22 @@ impl App {
                     self.draw();
                 }
                 Input::FocusGained | Input::FocusLost => {
-                    self.outer.entry(id).or_default().unfocused = input == Input::FocusLost;
+                    let outer = self.outer.entry(id).or_default();
+                    outer.unfocused = input == Input::FocusLost;
+                    if outer.unfocused {
+                        outer.escapes.reset();
+                    }
                     self.dirty = true;
                 }
                 _ => {}
             },
             Request::Input(_) => return Err("attach before sending input".into()),
+            Request::Keyboard(flags) if self.catalog.client(id).is_some() => {
+                let escapes = &mut self.outer.entry(id).or_default().escapes;
+                escapes.reset();
+                escapes.events = flags & 2 != 0;
+            }
+            Request::Keyboard(_) => return Err("attach before telling keyboard flags".into()),
             Request::Colors(palette) if self.catalog.client(id).is_some() => {
                 self.outer.entry(id).or_default().palette = Some(palette);
                 self.paint(id);
@@ -746,11 +759,27 @@ impl App {
     }
 
     fn key(&mut self, client: u64, key: KeyEvent) -> Result<(), String> {
+        let (session, decoration) = self.decoration(client)?;
+        let mut next = self.projection(Some(client));
+        match self.outer.entry(client).or_default().escapes.key(
+            &key,
+            next.navigation.is_none(),
+            decoration.gestures,
+            Instant::now(),
+        ) {
+            Action::Open => {
+                nav::open(&mut next);
+                return self.commit(client, next);
+            }
+            Action::Consume => return Ok(()),
+            Action::Pass => {}
+        }
+        if key.kind == KeyEventKind::Release {
+            return Ok(());
+        }
         let Some(notation) = keys::notation(&key) else {
             return Ok(());
         };
-        let (session, decoration) = self.decoration(client)?;
-        let mut next = self.projection(Some(client));
         if decoration.binds("panel", &notation) {
             if next.navigation.is_some() {
                 nav::close(&mut next);
@@ -761,7 +790,9 @@ impl App {
         }
         // plugin keys of navigation act on the native representation
         if next.navigation.as_ref().is_none_or(|nav| {
-            nav.operation.is_none() && next.representation == StateRepresentation::Native
+            nav.operation.is_none()
+                && nav.search.is_none()
+                && next.representation == StateRepresentation::Native
         }) {
             let plugins = self
                 .views
@@ -786,7 +817,12 @@ impl App {
             }
         }
         if let Some(navigation) = &next.navigation {
-            let translated = if navigation.operation.is_some() {
+            let translated = if navigation.operation.is_some()
+                || navigation
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.editing)
+            {
                 Some(key)
             } else {
                 decoration.navigation_key(&notation)
@@ -824,6 +860,7 @@ impl App {
     }
 
     fn paste(&mut self, client: u64, text: &str) -> Result<(), String> {
+        self.outer.entry(client).or_default().escapes.reset();
         let mut next = self.projection(Some(client));
         if next.navigation.is_some() {
             nav::paste(&mut next, text);
@@ -977,6 +1014,42 @@ impl App {
             }
         }
         self.cleanup();
+    }
+
+    /// Hold timers run at the input-loop cadence, not the slower file/PTY tick.
+    pub fn poll_gestures(&mut self) {
+        let now = Instant::now();
+        let pending: Vec<u64> = self
+            .outer
+            .iter()
+            .filter(|(_, outer)| outer.escapes.waiting())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in pending {
+            if self
+                .catalog
+                .client(id)
+                .is_none_or(|client| client.navigation.is_some())
+            {
+                continue;
+            }
+            let Ok((_, decoration)) = self.decoration(id) else {
+                continue;
+            };
+            if self
+                .outer
+                .get_mut(&id)
+                .unwrap()
+                .escapes
+                .poll(decoration.gestures, now)
+            {
+                let mut next = self.projection(Some(id));
+                nav::open(&mut next);
+                if let Err(error) = self.commit(id, next) {
+                    self.notice(id, error);
+                }
+            }
+        }
     }
 
     pub fn tick(&mut self) {

@@ -259,6 +259,7 @@ mod tests {
                     },
                     folder: Some("/home/me".into()),
                     operation: None,
+                    search: None,
                 }),
                 representation: StateRepresentation::Fs,
             }],

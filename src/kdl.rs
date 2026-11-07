@@ -24,8 +24,8 @@
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use crate::state::{
-    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Session, Status, Terminal,
-    Window, Workspace,
+    DEFAULT_LAYOUT, Level, Location, Navigation, Nui, Operation, Pane, Search, SearchHit, Session,
+    Status, Terminal, Window, Workspace,
 };
 
 const HEADER: &str = "// nui-yalij state: the single source of truth, applied live when changed.\n";
@@ -118,6 +118,25 @@ pub(crate) fn navigation(navigation: &Navigation) -> KdlNode {
         node = node.prop(level.name(), index(cursor.get(level)));
     }
     node = node.option("folder", navigation.folder.as_deref());
+    if let Some(search) = &navigation.search {
+        let mut child = self::node("search")
+            .arg(search.query.as_str())
+            .prop("editing", search.editing)
+            .prop("selected", index(search.selected));
+        for hit in &search.results {
+            child = child.child(
+                self::node("result")
+                    .arg(hit.label.as_str())
+                    .prop("session", hit.session as i128)
+                    .prop("terminal", hit.terminal as i128)
+                    .prop("workspace", index(hit.workspace))
+                    .prop("window", index(hit.window))
+                    .prop("pane", index(hit.pane))
+                    .0,
+            );
+        }
+        node = node.child(child.0);
+    }
     match &navigation.operation {
         Some(Operation::Rename { input }) => {
             node = node.child(self::node("rename").arg(input.as_str()).0)
@@ -430,7 +449,15 @@ impl<'a> Decoder<'a> {
             cursor.set(level, entries.index(name(level))?.unwrap_or(0));
         }
         let mut operation = None;
-        for child in self.children(node, &["rename", "create", "remove", "stop"])? {
+        let mut search = None;
+        for child in self.children(node, &["rename", "create", "remove", "stop", "search"])? {
+            if child.name().value() == "search" {
+                if search.is_some() {
+                    return Err(self.error(child, "duplicate search"));
+                }
+                search = Some(self.search(child)?);
+                continue;
+            }
             let entries = self.read(child, &[])?;
             operation = Some(match child.name().value() {
                 "rename" => Operation::Rename {
@@ -443,11 +470,52 @@ impl<'a> Decoder<'a> {
                 _ => Operation::Stop,
             });
         }
+        if operation.is_some() && search.is_some() {
+            return Err(self.error(node, "search and an operation cannot be open together"));
+        }
         Ok(Navigation {
             focus,
             cursor,
             folder: entries.string("folder")?,
             operation,
+            search,
+        })
+    }
+
+    fn search(&self, node: &KdlNode) -> Result<Search, String> {
+        let entries = self.read(node, &["editing", "selected"])?;
+        let editing = match node.get("editing") {
+            Some(KdlValue::Bool(value)) => *value,
+            None => true,
+            _ => return Err(self.error(node, "editing should be a boolean")),
+        };
+        let mut results = Vec::new();
+        for child in self.children(node, &["result"])? {
+            let fields = self.read(
+                child,
+                &["session", "terminal", "workspace", "window", "pane"],
+            )?;
+            self.children(child, &[])?;
+            let positive = |key| {
+                fields
+                    .number::<u64>(key)?
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| fields.error(&format!("{key} must be a positive integer")))
+            };
+            results.push(SearchHit {
+                session: positive("session")?,
+                terminal: positive("terminal")?,
+                workspace: fields.index("workspace")?.unwrap_or(0),
+                window: fields.index("window")?.unwrap_or(0),
+                pane: fields.index("pane")?.unwrap_or(0),
+                label: fields.string_arg()?,
+            });
+        }
+        Ok(Search {
+            query: entries.optional_string_arg()?.unwrap_or_default(),
+            editing,
+            selected: entries.index("selected")?.unwrap_or(0),
+            results,
         })
     }
 }
@@ -553,6 +621,7 @@ mod tests {
             operation: Some(Operation::Rename {
                 input: "draft".into(),
             }),
+            search: None,
         });
         nui.message = Some("hello".into());
         let text = encode(&nui);
@@ -565,6 +634,16 @@ mod tests {
         let navigation = nui.navigation.as_mut().unwrap();
         navigation.folder = Some("/home/me/a \"b\"".into());
         navigation.operation = None;
+        let text = encode(&nui);
+        assert_eq!(decode(&text).unwrap(), nui, "{text}");
+        crate::search::start(&mut nui);
+        nui.navigation
+            .as_mut()
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .editing = false;
         let text = encode(&nui);
         assert_eq!(decode(&text).unwrap(), nui, "{text}");
     }

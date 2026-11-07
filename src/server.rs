@@ -85,6 +85,7 @@ pub fn serve(state: PathBuf, config: PathBuf, legacy: Option<PathBuf>) -> Result
                     Err(error) => return Err(error.to_string()),
                 }
             }
+            app.poll_gestures();
             app.draw();
             let delay = tick
                 .saturating_duration_since(Instant::now())

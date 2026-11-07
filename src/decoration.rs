@@ -15,11 +15,12 @@ use ratatui::{
 };
 
 use crate::{
+    gestures::Gestures,
     global::{check, children},
     keys,
 };
 
-const ACTIONS: [(&str, &[&str]); 16] = [
+const ACTIONS: [(&str, &[&str]); 17] = [
     ("panel", &["ctrl-t"]),
     ("left", &["h", "left"]),
     ("right", &["l", "right"]),
@@ -31,6 +32,7 @@ const ACTIONS: [(&str, &[&str]); 16] = [
     ("rename", &["r"]),
     ("remove", &["x"]),
     ("stop", &["s"]),
+    ("search", &["/"]),
     ("enter", &["enter"]),
     ("back", &["esc"]),
     ("detach", &["q"]),
@@ -47,6 +49,7 @@ pub struct Layer {
     pub keys: BTreeMap<String, Vec<String>>,
     pub commands: BTreeMap<String, Vec<String>>,
     pub theme: BTreeMap<String, String>,
+    pub gestures: BTreeMap<String, u64>,
     pub icons: Option<Icons>,
     pub plugins: Vec<String>,
 }
@@ -112,6 +115,7 @@ pub struct Decoration {
     keys: BTreeMap<String, Vec<String>>,
     commands: BTreeMap<String, Vec<String>>,
     pub theme: Theme,
+    pub gestures: Gestures,
     pub icons: Icons,
     pub plugins: Vec<String>,
 }
@@ -135,6 +139,7 @@ impl Default for Decoration {
             keys: defaults(&ACTIONS),
             commands: defaults(&COMMANDS),
             theme: Theme::default(),
+            gestures: Gestures::default(),
             icons: Icons::default(),
             plugins: Vec::new(),
         }
@@ -145,6 +150,13 @@ impl Decoration {
     fn overlay(&mut self, layer: &Layer) {
         self.keys.extend(layer.keys.clone());
         self.commands.extend(layer.commands.clone());
+        for (name, value) in &layer.gestures {
+            match name.as_str() {
+                "double-escape-ms" => self.gestures.double_escape_ms = *value,
+                "hold-escape-ms" => self.gestures.hold_escape_ms = *value,
+                _ => unreachable!(),
+            }
+        }
         for (name, value) in &layer.theme {
             let color = Color::from_str(value).expect("validated color");
             match name.as_str() {
@@ -206,6 +218,7 @@ impl Decoration {
             "rename" => KeyCode::Char('r'),
             "remove" => KeyCode::Char('x'),
             "stop" => KeyCode::Char('s'),
+            "search" => KeyCode::Char('/'),
             "enter" => KeyCode::Enter,
             "back" => KeyCode::Esc,
             "detach" => KeyCode::Char('q'),
@@ -238,7 +251,9 @@ impl Layer {
         let mut blocks = std::collections::HashSet::new();
         for node in doc.nodes() {
             let name = node.name().value();
-            if ["keys", "commands", "theme", "icons"].contains(&name) && !blocks.insert(name) {
+            if ["keys", "commands", "theme", "icons", "gestures"].contains(&name)
+                && !blocks.insert(name)
+            {
                 return Err(format!("duplicate {name} block"));
             }
             match name {
@@ -265,6 +280,25 @@ impl Layer {
                             .ok_or("a theme color must be a string")?;
                         Color::from_str(color).map_err(|_| format!("{color} is not a color"))?;
                         layer.theme.insert(name.into(), color.into());
+                    }
+                }
+                "gestures" => {
+                    check(
+                        node,
+                        "gestures",
+                        &["double-escape-ms", "hold-escape-ms"],
+                        &[],
+                        0,
+                    )?;
+                    for entry in node.entries() {
+                        let name = entry.name().unwrap().value();
+                        let milliseconds = entry
+                            .value()
+                            .as_integer()
+                            .and_then(|n| u64::try_from(n).ok())
+                            .filter(|n| *n <= 60_000)
+                            .ok_or_else(|| format!("{name} must be an integer from 0 to 60000"))?;
+                        layer.gestures.insert(name.into(), milliseconds);
                     }
                 }
                 "icons" => {
@@ -467,6 +501,34 @@ mod tests {
     }
 
     #[test]
+    fn gestures_override_individually_and_zero_disables_one() {
+        let layer = |text| Layer::decode(text, Path::new(".")).unwrap();
+        let library = Library {
+            root: PathBuf::new(),
+            global: layer("gestures double-escape-ms=250 hold-escape-ms=800"),
+            profiles: HashMap::from([(
+                "quiet".into(),
+                layer("gestures double-escape-ms=0\nkeys { search f }"),
+            )]),
+        };
+        let effective = library
+            .effective(Some("quiet"), &layer("gestures hold-escape-ms=1000"))
+            .unwrap();
+        assert_eq!(
+            effective.gestures,
+            Gestures {
+                double_escape_ms: 0,
+                hold_escape_ms: 1000
+            }
+        );
+        assert_eq!(
+            effective.navigation_key("f").unwrap().code,
+            KeyCode::Char('/')
+        );
+        assert!(effective.navigation_key("/").is_none());
+    }
+
+    #[test]
     fn icons_are_nerd_unless_plain() {
         let layer = |text| Layer::decode(text, Path::new(".")).unwrap();
         assert_eq!(Decoration::default().icons, Icons::Nerd);
@@ -555,6 +617,11 @@ mod tests {
             "icons nope",
             "icons plain x=1",
             "icons plain\nicons nerd",
+            "gestures double-escape-ms=-1",
+            "gestures hold-escape-ms=60001",
+            "gestures hold-escape-ms=\"600\"",
+            "gestures nope=100",
+            "gestures\ngestures",
         ] {
             assert!(Layer::decode(text, Path::new(".")).is_err(), "{text}");
         }

@@ -50,6 +50,8 @@ impl Home {
     fn env(&self) -> Vec<(&'static str, String)> {
         vec![
             ("SHELL", "/bin/sh".into()),
+            // Never pick up commands belonging to the developer's parent session.
+            ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin".into()),
             ("HOME", self.dir.display().to_string()),
             ("PS1", "$ ".into()),
             ("ENV", String::new()),
@@ -76,6 +78,7 @@ impl Home {
             ])
             .args(args)
             .env_remove("NUI_YALIJ_STATE")
+            .env_remove("NUI_YALIJ_CONFIG")
             .env_remove("NUI_YALIJ_SESSION")
             .env_remove("NUI_YALIJ_TERMINAL")
             .envs(self.env())
@@ -168,7 +171,12 @@ impl Tui {
         for (key, value) in home.env() {
             command.env(key, value);
         }
-        for key in ["NUI_YALIJ_STATE", "NUI_YALIJ_SESSION", "NUI_YALIJ_TERMINAL"] {
+        for key in [
+            "NUI_YALIJ_STATE",
+            "NUI_YALIJ_CONFIG",
+            "NUI_YALIJ_SESSION",
+            "NUI_YALIJ_TERMINAL",
+        ] {
             command.env_remove(key);
         }
         command.cwd(&home.dir);
@@ -664,7 +672,7 @@ fn programs_talk_to_the_terminal_around_through_the_client() {
     tui.wait("questions", |tui| {
         tui.raw().contains("\x1b]11;?\x07\x1b]4;0;?")
     });
-    assert!(tui.raw().contains("\x1b[>5u"));
+    assert!(tui.raw().contains("\x1b[>7u"));
     tui.send("\x1b[?5u\x1b]11;rgb:1111/2222/3333\x1b\\\x1b[?62;22c");
 
     // shift with enter, in kitty's escape codes, reaches a program asking for them...
@@ -1049,6 +1057,212 @@ fn deleting_one_client_node_disconnects_only_that_instance() {
     b.text_is("still-here");
     assert_eq!(home.pid(1, 1), Some(pid));
     b.detach("\x14");
+}
+
+#[test]
+fn configuration_and_skill_commands_are_local_explicit_and_never_overwrite() {
+    let home = Home::new("config-cli");
+    let config = home.config().join("decoration.kdl");
+    assert_eq!(home.ok(&["config"]).trim(), config.to_str().unwrap());
+    let template = home.ok(&["config", "show"]);
+    assert!(template.contains("double-escape-ms=300") && template.contains("search \"/\""));
+    assert!(home.ok(&["config", "init"]).contains("--apply"));
+    home.ok(&["config", "check"]);
+    assert!(!home.config().exists());
+    assert_eq!(
+        home.ok(&["skill"]),
+        include_str!("../skills/nui-yalij/SKILL.md")
+    );
+    assert!(home.ok(&["help"]).contains("skill"));
+    assert!(!home.global().exists());
+    assert!(!home.dir.join("global.kdl.server.log").exists());
+    home.ok(&["config", "init", "--apply"]);
+    assert_eq!(fs::read_to_string(&config).unwrap(), template);
+    assert!(
+        !home
+            .command(&["config", "init", "--apply"])
+            .status
+            .success()
+    );
+    assert_eq!(home.ok(&["config", "show"]), template);
+    let profile = home.config().join("profiles/work.kdl");
+    assert_eq!(
+        home.ok(&["--profile", "work", "config", "path"]).trim(),
+        profile.to_str().unwrap()
+    );
+    home.ok(&["--profile", "work", "config", "init", "--apply"]);
+    home.ok(&["--profile", "work", "config", "check"]);
+    home.write(&config, "gestures hold-escape-ms=-1");
+    assert!(!home.command(&["config", "check"]).status.success());
+    assert_eq!(home.ok(&["config", "show"]), "gestures hold-escape-ms=-1");
+    assert!(!home.global().exists());
+}
+
+#[test]
+fn escape_gestures_are_per_instance_use_reports_or_repeats_and_can_be_disabled() {
+    let home = Home::new("gestures");
+    home.write(
+        &home.config().join("profiles/quiet.kdl"),
+        "gestures double-escape-ms=0 hold-escape-ms=0",
+    );
+    home.write(
+        &home.config().join("profiles/repeat.kdl"),
+        "gestures double-escape-ms=0",
+    );
+    let mut tui = Tui::start(&home, &[]);
+    tui.prompt();
+    // Check routing before Escape gestures leave input in the shell's editor.
+    tui.send(&format!("'{BIN}' config path\r"));
+    tui.text_is(home.config().join("decoration.kdl").to_str().unwrap());
+    let mut quiet = Tui::start(&home, &["--profile", "quiet"]);
+    quiet.prompt();
+    tui.send("\x1b\x1b");
+    tui.text_is(" native ");
+    assert!(!quiet.text().contains(" native "));
+    tui.send("\x14");
+    tui.view();
+    quiet.send("\x1b\x1b");
+    thread::sleep(Duration::from_millis(750));
+    assert!(!quiet.text().contains(" native "));
+    // A lone Escape on a terminal without releases is never a guessed hold.
+    tui.send("\x1b");
+    thread::sleep(Duration::from_millis(750));
+    assert!(!tui.text().contains(" native "));
+
+    // Negotiate kitty event types. A short press/release cancels the hold timer.
+    tui.send("\x1b[?7u\x1b[?62;22c");
+    tui.send("\x1b[27u\x1b[27;1:3u");
+    thread::sleep(Duration::from_millis(750));
+    assert!(!tui.text().contains(" native "));
+    tui.send("\x1b[27u\x1b[27;1:3u\x1b[27u\x1b[27;1:3u");
+    tui.text_is(" native ");
+    tui.send("\x14");
+    tui.view();
+    tui.send("\x1b[27u");
+    tui.text_is(" native "); // Timer, without any repeat event.
+    tui.send("\x1b[27;1:2u\x1b[27;1:2u");
+    assert!(
+        tui.text().contains(" native "),
+        "repeats must not close the panel"
+    );
+    tui.send("\x1b[27;1:3u\x1b[27u\x1b[27;1:3u");
+    tui.view();
+    tui.send("\x1b[27u\x1b[O");
+    thread::sleep(Duration::from_millis(750));
+    assert!(
+        !tui.text().contains(" native "),
+        "focus loss cancels a pending hold"
+    );
+    tui.send("\x1b[I\x1b[27;1:3u");
+
+    let mut repeat = Tui::start(&home, &["--profile", "repeat"]);
+    repeat.prompt();
+    repeat.send("\x1b");
+    thread::sleep(Duration::from_millis(400));
+    repeat.send("\x1b");
+    repeat.send("\x1b");
+    repeat.text_is(" native ");
+    repeat.send("\x1b");
+    assert!(repeat.text().contains(" native "));
+    repeat.send("\x14");
+    repeat.view();
+
+    // Live session decoration overrides all profiles, including precise holds.
+    home.write(
+        &home.decoration(1),
+        "gestures double-escape-ms=0 hold-escape-ms=0",
+    );
+    tui.send("\x1b[27u\x1b[27;1:3u\x1b[27u\x1b[27;1:3u");
+    assert!(!tui.text().contains(" native "));
+    tui.send("\x1b[27u");
+    thread::sleep(Duration::from_millis(750));
+    assert!(!tui.text().contains(" native "));
+    tui.send("\x1b[27;1:3u");
+    tui.detach("\x14");
+    quiet.detach("\x14");
+    repeat.detach("\x14");
+}
+
+#[test]
+fn slash_search_is_live_then_frozen_across_sessions_without_affecting_other_clients() {
+    let home = Home::new("search");
+    home.write(&home.global(), r#"
+        session alpha id=1 {
+            terminal 1 command="/bin/sh"
+            terminal 2 command="/bin/sh"
+            workspace local { window editor { pane console terminal=1; pane notes terminal=2 } }
+        }
+        session beta id=2 {
+            terminal 1 command="/bin/sh"
+            terminal 2 command="/bin/sh"
+            workspace project { window target { pane remote-one terminal=1; pane remote-two terminal=2 } }
+        }
+    "#);
+    let mut tui = Tui::start(&home, &["attach", "alpha"]);
+    tui.prompt();
+    let mut watcher = Tui::start(&home, &["attach", "alpha"]);
+    watcher.prompt();
+    tui.send("echo original-$((40+2))\r");
+    tui.text_is("original-42");
+    tui.send("\x14/");
+    tui.text_is("1/4 panes");
+    assert!(
+        tui.rows()
+            .iter()
+            .skip(ROWS as usize / 2)
+            .any(|row| row.contains("original-42"))
+    );
+    tui.send("remote");
+    tui.text_is("1/2 panes");
+    tui.send("z");
+    tui.text_is("No matching panes");
+    tui.send("\x7f");
+    tui.text_is("1/2 panes");
+    assert!(!watcher.text().contains(" native ") && !watcher.text().contains("Search /"));
+    tui.send("\r");
+    tui.text_is("Search / remote");
+    let old = home.read(2);
+    assert!(old.contains("pane remote-two terminal=2"), "{old}");
+    home.write(
+        &home.session(2),
+        &old.replace(
+            "pane remote-two terminal=2",
+            "pane remote-two terminal=2\n            pane remote-new terminal=1",
+        ),
+    );
+    home.wait("new matching pane", || home.read(2).contains("remote-new"));
+    thread::sleep(Duration::from_millis(350));
+    assert!(
+        tui.text().contains("1/2 panes"),
+        "a frozen list must not acquire a new match"
+    );
+    tui.send("j");
+    tui.text_is("2/2 panes");
+    tui.send("\r");
+    tui.prompt();
+    home.wait("search enters foreign session", || {
+        fs::read_to_string(home.global())
+            .unwrap()
+            .contains("client 1 session=2")
+    });
+    assert!(!watcher.text().contains(" native "));
+    assert!(home.read(2).contains("active=2"));
+    tui.send("\x14r/");
+    tui.text_is("Rename:");
+    assert!(!tui.text().contains("Search /"));
+    tui.send("\x1b");
+    tui.text_is(" native ");
+    tui.send("]/");
+    tui.text_is("1/5 panes");
+    // Query paste is literal, not a navigation operation, in fs too.
+    tui.send("\x1b[200~remote-two\x1b[201~");
+    tui.text_is("1/1 panes");
+    tui.send("\x1b");
+    tui.text_is(" native ");
+    tui.send("\x1b");
+    tui.prompt();
+    tui.detach("\x14");
+    watcher.detach("\x14");
 }
 
 #[test]

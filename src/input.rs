@@ -113,7 +113,18 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Option<Input> {
-    Some(Input::Event(Event::Key(KeyEvent::new(code, modifiers))))
+    key_kind(code, modifiers, 1)
+}
+
+fn key_kind(code: KeyCode, modifiers: KeyModifiers, kind: u32) -> Option<Input> {
+    let kind = match kind {
+        2 => KeyEventKind::Repeat,
+        3 => KeyEventKind::Release,
+        _ => KeyEventKind::Press,
+    };
+    Some(Input::Event(Event::Key(KeyEvent::new_with_kind(
+        code, modifiers, kind,
+    ))))
 }
 
 fn step(bytes: &[u8], flush: bool) -> Step {
@@ -322,11 +333,15 @@ fn sequence(body: &[u8], last: u8) -> Option<Input> {
                 n @ 31..=34 => KeyCode::F(n as u8 - 17),
                 _ => return None,
             };
-            key(code, held(modifiers))
+            key_kind(code, held(modifiers), number(1, 1).unwrap_or(1))
         }
         (None, b'I') => Some(Input::Event(Event::FocusGained)),
         (None, b'O') => Some(Input::Event(Event::FocusLost)),
-        (None, b'Z') => key(KeyCode::BackTab, held(modifiers) | KeyModifiers::SHIFT),
+        (None, b'Z') => key_kind(
+            KeyCode::BackTab,
+            held(modifiers) | KeyModifiers::SHIFT,
+            number(1, 1).unwrap_or(1),
+        ),
         (None, b'A'..=b'D' | b'H' | b'F' | b'P'..=b'S') => {
             let code = match last {
                 b'A' => KeyCode::Up,
@@ -339,7 +354,7 @@ fn sequence(body: &[u8], last: u8) -> Option<Input> {
                 b'R' if number(0, 0).is_some_and(|n| n != 1) => return None,
                 _ => KeyCode::F(last - b'P' + 1),
             };
-            key(code, held(modifiers))
+            key_kind(code, held(modifiers), number(1, 1).unwrap_or(1))
         }
         _ => None,
     }
@@ -426,14 +441,7 @@ fn keyed(
             KeyCode::Char(c)
         }
     };
-    let kind = match kind {
-        2 => KeyEventKind::Repeat,
-        3 => KeyEventKind::Release,
-        _ => KeyEventKind::Press,
-    };
-    Some(Input::Event(Event::Key(KeyEvent::new_with_kind(
-        code, modifiers, kind,
-    ))))
+    key_kind(code, modifiers, kind)
 }
 
 #[cfg(test)]
@@ -507,6 +515,25 @@ mod tests {
         };
         assert_eq!(release.kind, KeyEventKind::Release);
         assert_eq!(keys(&mut decoder, b"\x1b[57414u"), ["enter"]);
+    }
+
+    #[test]
+    fn named_keys_keep_repeat_and_release_reports() {
+        let mut decoder = Decoder::default();
+        let inputs = decoder.feed(b"\x1b[1;1:3A\x1b[3;1:3~\x1b[1;2:3Z\x1b[1;1:2P\x1b[27;1:2u");
+        for (input, (code, kind)) in inputs.iter().zip([
+            (KeyCode::Up, KeyEventKind::Release),
+            (KeyCode::Delete, KeyEventKind::Release),
+            (KeyCode::BackTab, KeyEventKind::Release),
+            (KeyCode::F(1), KeyEventKind::Repeat),
+            (KeyCode::Esc, KeyEventKind::Repeat),
+        ]) {
+            let Input::Event(Event::Key(key)) = input else {
+                panic!()
+            };
+            assert_eq!((key.code, key.kind), (code, kind));
+        }
+        assert_eq!(inputs.len(), 5);
     }
 
     #[test]

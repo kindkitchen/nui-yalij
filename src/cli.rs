@@ -15,7 +15,7 @@ use ratatui::{
 };
 
 use crate::{
-    app, client,
+    app, client, config,
     global::{self, Catalog},
     ipc::Request,
     lifecycle, session,
@@ -35,6 +35,8 @@ commands:
                      instance that last typed there: t opens navigation
   list               list sessions and connected instances, without starting them
   reload             reload global/profile decoration and plugin files
+  config [path|show|init|check] inspect, create (--apply) or validate configuration
+  skill              print the bundled agent skill (Markdown) without writing files
   kill [--apply]     observe, or stop this catalog's servers and all its clients
   server             host the session servers in the foreground
   install [<version>] [--apply] install the latest/requested crate with Cargo
@@ -48,15 +50,19 @@ asks Apply? (N/y). Nothing executes before y, even with --apply.
 
 State: $XDG_STATE_HOME/nui-yalij/global-state.kdl (~/.local/state/...).
 Decoration: $XDG_CONFIG_HOME/nui-yalij (~/.config/...). Profiles are per
-instance; active windows/panes are shared state. ctrl-t, or t inside a pane,
-opens navigation: q disconnects only this instance; Q stops this catalog's servers.
+instance; active windows/panes are shared state. ctrl-t, double/held esc, or t
+inside a pane opens navigation; / searches panes. q disconnects only this
+instance; Q stops this catalog's servers. config defaults to path; --profile
+selects its profile file. init never overwrites; check validates global/profiles.
 ";
 
-const COMMANDS: [&str; 12] = [
+const COMMANDS: [&str; 14] = [
     "attach",
     "call",
     "list",
     "reload",
+    "config",
+    "skill",
     "kill",
     "server",
     "install",
@@ -91,6 +97,9 @@ pub fn default_path() -> PathBuf {
 }
 
 fn default_config() -> PathBuf {
+    if let Some(path) = env::var_os("NUI_YALIJ_CONFIG") {
+        return path.into();
+    }
     env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
@@ -209,7 +218,7 @@ impl Options {
             return Err(format!("unknown command {command}; use help"));
         }
         let (minimum, maximum) = match command {
-            "attach" | "install" | "update" => (1, 2),
+            "attach" | "install" | "update" | "config" => (1, 2),
             "call" => (2, 2),
             _ => (1, 1),
         };
@@ -218,6 +227,14 @@ impl Options {
         }
         if self.words.len() < minimum {
             return Err(format!("{command} needs an argument"));
+        }
+        if command == "config"
+            && let Some(action) = self.words.get(1)
+            && !config::ACTIONS.contains(&action.as_str())
+        {
+            return Err(format!(
+                "unknown config action {action}; use path, show, init or check"
+            ));
         }
         Ok(())
     }
@@ -293,6 +310,13 @@ pub fn run(mut options: Options) -> Result<(), String> {
     match command {
         "help" => print!("{USAGE}"),
         "version" => println!("nui-yalij {}", env!("CARGO_PKG_VERSION")),
+        "skill" => print!("{}", include_str!("../skills/nui-yalij/SKILL.md")),
+        "config" => {
+            return config::run(
+                options.words.get(1).map_or("path", String::as_str),
+                &options,
+            );
+        }
         "install" | "update" | "uninstall" | "remove" => return lifecycle::run(command, &options),
         "server" => {
             return crate::server::serve(
@@ -378,6 +402,17 @@ fn complete(options: &mut Options) -> Result<bool, String> {
                 return Ok(false);
             };
             options.words.push(commands[index].clone());
+        }
+        if options.words == ["config"] {
+            let actions: Vec<String> = config::ACTIONS
+                .iter()
+                .map(|action| action.to_string())
+                .collect();
+            let Some(index) = choose("Config action", &actions)? else {
+                options.words.clear();
+                continue;
+            };
+            options.words.push(actions[index].clone());
         }
         if options.words == ["attach"] {
             let mut names: Vec<String> = sessions(options)?
@@ -508,6 +543,12 @@ mod tests {
         assert!(parse(&["call"]).is_err());
         assert!(parse(&["call", "t", "extra"]).is_err());
         assert!(parse(&["call", "t"]).is_ok());
+        assert!(parse(&["config"]).is_ok());
+        assert!(parse(&["config", "init", "--apply"]).is_ok());
+        assert!(parse(&["config", "bogus"]).is_err());
+        assert!(parse(&["config", "show", "extra"]).is_err());
+        assert!(parse(&["skill"]).is_ok());
+        assert!(parse(&["skill", "extra"]).is_err());
         assert!(parse(&["--profile", "../escape"]).is_err());
         let options = parse(&["kill", "--repl", "--apply", "--profile=work"]).unwrap();
         assert!(options.repl && options.apply);

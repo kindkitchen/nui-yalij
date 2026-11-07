@@ -39,7 +39,7 @@ use crate::{
 
 /// Asked of the terminal around on attach: save its title; keys told apart,
 /// with the keys of the base layout; reports of focus and the color scheme.
-const SETUP: &[u8] = b"\x1b[22;2t\x1b[>5u\x1b[?1004h\x1b[?2031h";
+const SETUP: &[u8] = b"\x1b[22;2t\x1b[>7u\x1b[?1004h\x1b[?2031h";
 /// Taken back on exit, modifyOtherKeys too when it was the way.
 const TEARDOWN: &[u8] = b"\x1b[<u\x1b[?1004l\x1b[?2031l\x1b[23;2t";
 const MODIFY_OTHER_KEYS: &[u8] = b"\x1b[>4;2m";
@@ -214,7 +214,10 @@ impl Talk {
     fn answer(&mut self, input: Input) -> Option<Request> {
         match input {
             Input::Event(event) => return Some(Request::Input(event)),
-            Input::Keyboard(flags) => self.kitty = flags != 0,
+            Input::Keyboard(flags) => {
+                self.kitty = flags != 0;
+                return Some(Request::Keyboard(flags));
+            }
             Input::Color(name, value) => {
                 self.palette.colors.insert(name, value);
             }

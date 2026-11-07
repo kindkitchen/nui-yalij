@@ -129,6 +129,35 @@ pub struct Navigation {
     pub folder: Option<String>,
     /// The operation waiting for approval.
     pub operation: Option<Operation>,
+    /// A per-instance query and its captured pane list, independent of representation.
+    #[serde(default)]
+    pub search: Option<Search>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Search {
+    pub query: String,
+    pub editing: bool,
+    #[serde(with = "one_based")]
+    pub selected: usize,
+    pub results: Vec<SearchHit>,
+}
+
+/// A captured pane: stable session/terminal identity plus its preferred placement.
+/// If that placement moves, resolution may follow the same terminal, never a
+/// different one that happens to occupy its old indices.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub session: u64,
+    pub terminal: u64,
+    #[serde(with = "one_based")]
+    pub workspace: usize,
+    #[serde(with = "one_based")]
+    pub window: usize,
+    #[serde(with = "one_based")]
+    pub pane: usize,
+    pub label: String,
 }
 
 /// A mapping of the state for navigation; the panel shows one at a time.
@@ -943,6 +972,14 @@ impl Nui {
         if let (Some(navigation), Some(cursor)) = (self.navigation.as_mut(), cursor) {
             navigation.cursor = cursor;
         }
+        if self
+            .navigation
+            .as_ref()
+            .is_some_and(|nav| nav.operation.is_some() && nav.search.is_some())
+        {
+            return Err("search and an operation cannot be open together".into());
+        }
+        crate::search::settle(self);
         Ok(())
     }
 
